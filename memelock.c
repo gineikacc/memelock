@@ -263,7 +263,8 @@ static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_resp
     return PAM_SUCCESS;
 }
 
-// --- Background snow ---
+// --- Background snow / lava / water / obsidian ---
+// Done: snow pile + tint + speed; lava melt -> water droplets; obsidian sink.
 // Future docket (not yet implemented):
 //  * snow plow entity  -> pile_push() ahead of it + debris particles
 //  * meteors           -> pile_blast() crater + spark/debris burst
@@ -274,7 +275,19 @@ static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_resp
 #define PILE_MAX_SLOPE 1.2f     // max height diff between adjacent columns (px)
 #define PILE_RELAX_ITERS 3
 
+#define LAVA_MAX 8
+#define LAVA_RADIUS 10.0f          // ~20px wide
+#define LAVA_MELT_COLS 10          // melts +/- this many columns
+#define LAVA_SPAWN_DENOM 5000      // 1 in 5000 flake respawns
+
+#define WATER_MAX 4000
+#define WATER_R 2.0f
+#define WATER_CELL 16              // spatial hash cell size (px)
+
+#define OBSIDIAN_MAX 32
+
 static float snow_speed_mult = 1.0f; // --snow-speed=N
+static int water_max = WATER_MAX;    // --water-max=N
 
 typedef enum { SNOW_TINT_MIX, SNOW_TINT_WHITE, SNOW_TINT_ICE } SnowTintMode;
 static SnowTintMode snow_tint_mode = SNOW_TINT_MIX; // --snow-tint=
@@ -287,6 +300,37 @@ static struct {
     float phase;
     Color tint;
 } snow[SNOW_COUNT];
+
+// Lava: falls, melts snow under it, becomes obsidian at screen bottom.
+static struct {
+    bool alive;
+    float x, y;
+    float speed;
+} lava[LAVA_MAX];
+
+// Obsidian: inert, sinks into the pile, unique shell color, never merges.
+static struct {
+    bool alive;
+    float x, y;
+    float sink_v;
+    Color shell;
+} obsidian[OBSIDIAN_MAX];
+
+// Water: individual droplets. active=false -> no physics (Minecraft sleep).
+static struct {
+    bool used;
+    bool active;
+    float x, y;
+    float vx, vy;
+} water[WATER_MAX];
+
+// Spatial hash over active water only: cell -> droplet index chain.
+#define WATER_GRID_W 256
+#define WATER_GRID_H 128
+static int water_cell_head[WATER_GRID_W * WATER_GRID_H];
+static int water_cell_next[WATER_MAX];
+static int water_active_n = 0;
+static int water_active_list[WATER_MAX];
 
 static float pile[1920]; // per-column snow depth (screen width capped)
 static int pile_w = 0;
@@ -404,6 +448,267 @@ PILE_HOOK static void pile_blast(int cx, int radius, float force) {
     pile_relax();
 }
 
+// --- Water droplets (individual, with sleep/activation) ---
+
+static int water_cell_of(float x, float y) {
+    int sw = GetScreenWidth(), sh = GetScreenHeight();
+    int cx = (int)(x / WATER_CELL);
+    int cy = (int)(y / WATER_CELL);
+    if (cx < 0) cx = 0;
+    if (cy < 0) cy = 0;
+    if (cx >= WATER_GRID_W) cx = WATER_GRID_W - 1;
+    if (cy >= WATER_GRID_H) cy = WATER_GRID_H - 1;
+    (void)sw; (void)sh;
+    return cy * WATER_GRID_W + cx;
+}
+
+static void water_wake(int i) {
+    if (i < 0 || i >= water_max || !water[i].used) return;
+    if (water[i].active) return;
+    water[i].active = true;
+    water_active_list[water_active_n++] = i;
+}
+
+static void water_sleep(int i) {
+    if (i < 0 || i >= water_max || !water[i].used) return;
+    if (!water[i].active) return;
+    water[i].active = false;
+    // swap-remove from active list
+    for (int k = 0; k < water_active_n; k++) {
+        if (water_active_list[k] == i) {
+            water_active_list[k] = water_active_list[--water_active_n];
+            return;
+        }
+    }
+}
+
+static int water_spawn(float x, float y) {
+    for (int i = 0; i < water_max; i++) {
+        if (water[i].used) continue;
+        water[i].used = true;
+        water[i].x = x;
+        water[i].y = y;
+        water[i].vx = 0.0f;
+        water[i].vy = 0.0f;
+        water[i].active = false;
+        water_wake(i);
+        return i;
+    }
+    // Pool full: recycle an inactive droplet (keeps count bounded).
+    for (int i = 0; i < water_max; i++) {
+        if (water[i].used && !water[i].active) {
+            water[i].x = x;
+            water[i].y = y;
+            water[i].vx = 0.0f;
+            water[i].vy = 0.0f;
+            water_wake(i);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void water_spawn_from_volume(float x, float y, float volume) {
+    // ~area of a WATER_R droplet per spawn; scale so melts aren't insane.
+    float per = 3.14f * WATER_R * WATER_R * 0.35f;
+    int n = (int)(volume / per);
+    if (n < 1 && volume > 0.5f) n = 1;
+    if (n > 24) n = 24;
+    for (int i = 0; i < n; i++) {
+        float jx = x + (float)GetRandomValue(-4, 4);
+        float jy = y + (float)GetRandomValue(-2, 2);
+        water_spawn(jx, jy);
+    }
+}
+
+static void water_build_grid(void) {
+    for (int c = 0; c < WATER_GRID_W * WATER_GRID_H; c++)
+        water_cell_head[c] = -1;
+    for (int k = 0; k < water_active_n; k++) {
+        int i = water_active_list[k];
+        int c = water_cell_of(water[i].x, water[i].y);
+        water_cell_next[i] = water_cell_head[c];
+        water_cell_head[c] = i;
+    }
+}
+
+// Wake sleepers near (x,y) — call when snow melts or new water arrives.
+static void water_wake_near(float x, float y, float radius) {
+    // Events are rare (melt/spawn); linear scan over used slots is fine.
+    float r2 = radius * radius;
+    for (int i = 0; i < water_max; i++) {
+        if (!water[i].used || water[i].active) continue;
+        float dx = water[i].x - x, dy = water[i].y - y;
+        if (dx * dx + dy * dy <= r2)
+            water_wake(i);
+    }
+}
+
+static void water_update(float dt) {
+    // Grid built once per frame from ACTIVE droplets only.
+    water_build_grid();
+
+    float g = 900.0f * snow_speed_mult;
+    int sh = GetScreenHeight();
+    int sw = GetScreenWidth();
+
+    // Snapshot active indices: sleep/wake during the pass mutates the live list.
+    static int snap[WATER_MAX];
+    int n = water_active_n;
+    if (n > WATER_MAX) n = WATER_MAX;
+    memcpy(snap, water_active_list, (size_t)n * sizeof(int));
+
+    for (int k = 0; k < n; k++) {
+        int i = snap[k];
+        if (i < 0 || i >= water_max || !water[i].used || !water[i].active) continue;
+
+        water[i].vy += g * dt;
+        if (water[i].vy > 600.0f) water[i].vy = 600.0f;
+        water[i].x += water[i].vx * dt;
+        water[i].y += water[i].vy * dt;
+        water[i].vx *= (1.0f - 2.0f * dt); // light drag
+
+        if (water[i].x < 0) { water[i].x = 0; water[i].vx = 0; }
+        if (water[i].x > sw - 1) { water[i].x = (float)sw - 1; water[i].vx = 0; }
+
+        float floor_y = ground_at(water[i].x) - WATER_R;
+        // Stack on active water below (same cell).
+        int cell = water_cell_of(water[i].x, water[i].y + WATER_R * 2);
+        for (int j = water_cell_head[cell]; j != -1; j = water_cell_next[j]) {
+            if (j == i) continue;
+            float dx = water[j].x - water[i].x;
+            float dy = water[j].y - water[i].y;
+            if (dx * dx + dy * dy < (WATER_R * 2.0f) * (WATER_R * 2.0f)) {
+                float top = water[j].y - WATER_R * 2.0f;
+                if (top < floor_y) floor_y = top;
+            }
+        }
+
+        if (water[i].y > floor_y) {
+            water[i].y = floor_y;
+            water[i].vy = 0.0f;
+
+            // Flow sideways toward lower ground if slope allows.
+            float here = ground_at(water[i].x);
+            float left = ground_at(water[i].x - 6.0f);
+            float right = ground_at(water[i].x + 6.0f);
+            // Lower ground => larger y value (screen coords). Slide that way.
+            if (left > here + 1.0f || right > here + 1.0f) {
+                if (right > left) water[i].vx += 80.0f * dt * snow_speed_mult;
+                else             water[i].vx -= 80.0f * dt * snow_speed_mult;
+                // Still moving downhill — stay awake next frame.
+                continue;
+            }
+
+            // Settled: no lower neighbor within reach -> sleep (no math next frames).
+            water_sleep(i);
+        }
+        // Off bottom (edge of screen): retire droplet.
+        if (water[i].y > (float)sh + 8.0f) {
+            water_sleep(i);
+            water[i].used = false;
+        }
+    }
+}
+
+// --- Lava ---
+
+static void lava_spawn(float x) {
+    for (int i = 0; i < LAVA_MAX; i++) {
+        if (lava[i].alive) continue;
+        lava[i].alive = true;
+        lava[i].x = x;
+        lava[i].y = -LAVA_RADIUS;
+        lava[i].speed = 220.0f + (float)GetRandomValue(0, 80);
+        return;
+    }
+}
+
+static void obsidian_spawn(float x, float y) {
+    static const Color shells[] = {
+        {180, 80, 255, 255}, {80, 200, 255, 255}, {255, 120, 80, 255},
+        {80, 255, 160, 255}, {255, 80, 160, 255}, {255, 220, 80, 255},
+    };
+    for (int i = 0; i < OBSIDIAN_MAX; i++) {
+        if (obsidian[i].alive) continue;
+        obsidian[i].alive = true;
+        obsidian[i].x = x;
+        obsidian[i].y = y;
+        obsidian[i].sink_v = 12.0f + (float)GetRandomValue(0, 20);
+        obsidian[i].shell = shells[GetRandomValue(0, 5)];
+        return;
+    }
+    // Pool full: steal the shallowest (least sunk) one.
+    int best = -1;
+    float best_y = 1e9f;
+    for (int i = 0; i < OBSIDIAN_MAX; i++) {
+        if (obsidian[i].alive && obsidian[i].y < best_y) {
+            best_y = obsidian[i].y;
+            best = i;
+        }
+    }
+    if (best >= 0) {
+        obsidian[best].alive = true;
+        obsidian[best].x = x;
+        obsidian[best].y = y;
+        obsidian[best].sink_v = 12.0f + (float)GetRandomValue(0, 20);
+        obsidian[best].shell = shells[GetRandomValue(0, 5)];
+    }
+}
+
+static void lava_update(float dt) {
+    float sh = (float)GetScreenHeight();
+    for (int i = 0; i < LAVA_MAX; i++) {
+        if (!lava[i].alive) continue;
+        lava[i].y += lava[i].speed * snow_speed_mult * dt;
+
+        // Melt snow in a column band under the droplet; runoff becomes water.
+        int cx = (int)lava[i].x;
+        float melted = 0.0f;
+        int lo = cx - LAVA_MELT_COLS, hi = cx + LAVA_MELT_COLS;
+        if (lo < 0) lo = 0;
+        if (hi >= pile_w) hi = pile_w - 1;
+        for (int x = lo; x <= hi; x++) {
+            float t = 1.0f - (float)abs(x - cx) / (float)(LAVA_MELT_COLS + 1);
+            if (t <= 0.0f) continue;
+            // Only melt near the droplet's vertical band (its way down).
+            float col_top = ground_at((float)x);
+            if (lava[i].y + LAVA_RADIUS < col_top) continue;
+            float cut = (40.0f + 80.0f * t) * dt * snow_speed_mult;
+            if (cut > pile[x]) cut = pile[x];
+            if (cut <= 0.0f) continue;
+            pile[x] -= cut;
+            melted += cut;
+        }
+        if (melted > 0.0f) {
+            pile_relax();
+            water_spawn_from_volume(lava[i].x, lava[i].y + LAVA_RADIUS, melted);
+            water_wake_near(lava[i].x, lava[i].y + LAVA_RADIUS, 24.0f);
+        }
+
+        // Touch bottom of screen -> obsidian, then sinks into whatever is below.
+        if (lava[i].y >= sh - LAVA_RADIUS * 0.5f) {
+            obsidian_spawn(lava[i].x, sh - LAVA_RADIUS);
+            lava[i].alive = false;
+        }
+    }
+}
+
+// Obsidian sinks below the surface over time (dense rock in soft snow).
+static void obsidian_update(float dt) {
+    float sh = (float)GetScreenHeight();
+    for (int i = 0; i < OBSIDIAN_MAX; i++) {
+        if (!obsidian[i].alive) continue;
+        // Sink toward ground line + a bit under the pile surface.
+        float target = ground_at(obsidian[i].x) + LAVA_RADIUS * 0.65f;
+        if (target > sh - 2.0f) target = sh - 2.0f;
+        if (obsidian[i].y < target) {
+            obsidian[i].y += obsidian[i].sink_v * dt;
+            if (obsidian[i].y > target) obsidian[i].y = target;
+        }
+    }
+}
+
 static void snow_init(void) {
     int sw = GetScreenWidth();
     if (sw > 1920) sw = 1920;
@@ -419,6 +724,12 @@ static void snow_init(void) {
         snow[i].phase = (float)GetRandomValue(0, 628) / 100.0f;
         snow[i].tint = snow_pick_tint();
     }
+    for (int i = 0; i < LAVA_MAX; i++) lava[i].alive = false;
+    for (int i = 0; i < OBSIDIAN_MAX; i++) obsidian[i].alive = false;
+    memset(water, 0, sizeof(water));
+    water_active_n = 0;
+    for (int c = 0; c < WATER_GRID_W * WATER_GRID_H; c++)
+        water_cell_head[c] = -1;
 }
 
 static void snow_update(float dt) {
@@ -436,22 +747,62 @@ static void snow_update(float dt) {
             snow[i].y = -snow[i].size;
             snow[i].x = (float)GetRandomValue(0, sw);
             snow[i].tint = snow_pick_tint();
+            // Occasional lava droplet instead of a plain respawn.
+            if (GetRandomValue(1, LAVA_SPAWN_DENOM) == 1)
+                lava_spawn(snow[i].x);
         }
     }
+
+    lava_update(dt);
+    water_update(dt);
+    obsidian_update(dt);
 }
 
 static void snow_draw(void) {
-    // Pile first, then falling flakes on top of it.
+    int sh = GetScreenHeight();
+
+    // Pile
     for (int x = 0; x < pile_w; x++) {
         if (pile[x] <= 0.0f) continue;
         int h = (int)pile[x];
-        DrawRectangle(x, GetScreenHeight() - h, 1, h,
+        DrawRectangle(x, sh - h, 1, h,
                       (Color){ 240, 245, 255, 230 });
     }
+
+    // Obsidian (embedded / sinking) — under water & falling stuff
+    for (int i = 0; i < OBSIDIAN_MAX; i++) {
+        if (!obsidian[i].alive) continue;
+        DrawCircleV((Vector2){ obsidian[i].x, obsidian[i].y }, LAVA_RADIUS * 0.85f,
+                    (Color){ 48, 16, 64, 255 }); // dark purple core
+        DrawCircleLines((int)obsidian[i].x, (int)obsidian[i].y,
+                        (int)(LAVA_RADIUS * 0.85f), obsidian[i].shell);
+        DrawCircleLines((int)obsidian[i].x, (int)obsidian[i].y,
+                        (int)(LAVA_RADIUS * 0.85f) - 1, obsidian[i].shell);
+    }
+
+    // Water droplets — only draw used ones (active and settled)
+    for (int i = 0; i < water_max; i++) {
+        if (!water[i].used) continue;
+        DrawCircleV((Vector2){ water[i].x, water[i].y }, WATER_R,
+                    (Color){ 40, 110, 255, 200 });
+    }
+
+    // Falling snow
     for (int i = 0; i < SNOW_COUNT; i++) {
         Color c = snow[i].tint;
         c.a = (unsigned char)(120 + (int)snow[i].size * 30);
         DrawCircleV((Vector2){ snow[i].x, snow[i].y }, snow[i].size, c);
+    }
+
+    // Lava on top (hot glow: core + faint halo)
+    for (int i = 0; i < LAVA_MAX; i++) {
+        if (!lava[i].alive) continue;
+        DrawCircleV((Vector2){ lava[i].x, lava[i].y }, LAVA_RADIUS + 3.0f,
+                    (Color){ 255, 80, 0, 50 });
+        DrawCircleV((Vector2){ lava[i].x, lava[i].y }, LAVA_RADIUS,
+                    (Color){ 255, 120, 20, 255 });
+        DrawCircleV((Vector2){ lava[i].x, lava[i].y }, LAVA_RADIUS * 0.45f,
+                    (Color){ 255, 220, 80, 255 });
     }
 }
 
@@ -482,6 +833,9 @@ int main(int argc, char **argv) {
             if (strcmp(t, "white") == 0) snow_tint_mode = SNOW_TINT_WHITE;
             else if (strcmp(t, "ice") == 0) snow_tint_mode = SNOW_TINT_ICE;
             else snow_tint_mode = SNOW_TINT_MIX;
+        } else if (strncmp(argv[i], "--water-max=", 12) == 0) {
+            int v = atoi(argv[i] + 12);
+            if (v >= 64 && v <= WATER_MAX) water_max = v;
         }
     }
 
