@@ -331,7 +331,10 @@ static struct {
 } obsidian[OBSIDIAN_MAX];
 
 static float pile[1920];       // per-column snow depth
-static Color pile_tint[1920];  // per-column blended flake tint
+// Float RGB avoids integer-truncation darkening over repeated blends.
+static float pile_tint_r[1920];
+static float pile_tint_g[1920];
+static float pile_tint_b[1920];
 static int pile_w = 0;
 
 static float pile_max(void) {
@@ -385,11 +388,15 @@ static void pile_mix_tint(int from, int to, float amount) {
     if (total <= 0.0f) return;
     float w_old = dest_old / total;
     float w_new = amount / total;
-    pile_tint[to].r = (unsigned char)(pile_tint[to].r * w_old + pile_tint[from].r * w_new);
-    pile_tint[to].g = (unsigned char)(pile_tint[to].g * w_old + pile_tint[from].g * w_new);
-    pile_tint[to].b = (unsigned char)(pile_tint[to].b * w_old + pile_tint[from].b * w_new);
-    if (dest_old <= 0.0f) pile_tint[to] = pile_tint[from];
-    pile_tint[to].a = 230;
+    if (dest_old <= 0.0f) {
+        pile_tint_r[to] = pile_tint_r[from];
+        pile_tint_g[to] = pile_tint_g[from];
+        pile_tint_b[to] = pile_tint_b[from];
+        return;
+    }
+    pile_tint_r[to] = pile_tint_r[to] * w_old + pile_tint_r[from] * w_new;
+    pile_tint_g[to] = pile_tint_g[to] * w_old + pile_tint_g[from] * w_new;
+    pile_tint_b[to] = pile_tint_b[to] * w_old + pile_tint_b[from] * w_new;
 }
 
 static void pile_relax(void) {
@@ -423,23 +430,41 @@ static void pile_relax(void) {
 }
 
 // Light horizontal blur so single-column tint hits don't read as vertical lines.
+// All math in float; only rounded once at draw time.
 static void pile_smooth_tint(void) {
-    static Color tmp[1920];
+    static float tr[1920], tg[1920], tb[1920];
     if (pile_w < 3) return;
     for (int x = 0; x < pile_w; x++) {
         int l = x > 0 ? x - 1 : x;
         int r = x < pile_w - 1 ? x + 1 : x;
-        // Only blend where both neighbors actually have snow.
         if (pile[l] <= 0.0f || pile[x] <= 0.0f || pile[r] <= 0.0f) {
-            tmp[x] = pile_tint[x];
+            tr[x] = pile_tint_r[x];
+            tg[x] = pile_tint_g[x];
+            tb[x] = pile_tint_b[x];
             continue;
         }
-        tmp[x].r = (unsigned char)((pile_tint[l].r + pile_tint[x].r * 2 + pile_tint[r].r) / 4);
-        tmp[x].g = (unsigned char)((pile_tint[l].g + pile_tint[x].g * 2 + pile_tint[r].g) / 4);
-        tmp[x].b = (unsigned char)((pile_tint[l].b + pile_tint[x].b * 2 + pile_tint[r].b) / 4);
-        tmp[x].a = 230;
+        tr[x] = (pile_tint_r[l] + pile_tint_r[x] * 2.0f + pile_tint_r[r]) * 0.25f;
+        tg[x] = (pile_tint_g[l] + pile_tint_g[x] * 2.0f + pile_tint_g[r]) * 0.25f;
+        tb[x] = (pile_tint_b[l] + pile_tint_b[x] * 2.0f + pile_tint_b[r]) * 0.25f;
     }
-    memcpy(pile_tint, tmp, (size_t)pile_w * sizeof(Color));
+    memcpy(pile_tint_r, tr, (size_t)pile_w * sizeof(float));
+    memcpy(pile_tint_g, tg, (size_t)pile_w * sizeof(float));
+    memcpy(pile_tint_b, tb, (size_t)pile_w * sizeof(float));
+}
+
+static unsigned char pile_chan_u8(float v) {
+    if (v < 0.0f) v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    return (unsigned char)(v + 0.5f); // round, never truncate toward black
+}
+
+static Color pile_color_at(int x) {
+    return (Color){
+        pile_chan_u8(pile_tint_r[x]),
+        pile_chan_u8(pile_tint_g[x]),
+        pile_chan_u8(pile_tint_b[x]),
+        230
+    };
 }
 
 // Heightmap ops — shared by flakes now; plows/meteors/mouse later.
@@ -454,26 +479,29 @@ static void pile_add(int x, float amount, Color tint) {
     // Blend flake tint into the landing column…
     float old = pile[x];
     float total = old + amount;
-    if (total > 0.0f) {
+    float tr = tint.r, tg = tint.g, tb = tint.b;
+    if (old <= 0.0f) {
+        pile_tint_r[x] = tr;
+        pile_tint_g[x] = tg;
+        pile_tint_b[x] = tb;
+    } else {
         float w_old = old / total;
         float w_new = amount / total;
-        pile_tint[x].r = (unsigned char)(pile_tint[x].r * w_old + tint.r * w_new);
-        pile_tint[x].g = (unsigned char)(pile_tint[x].g * w_old + tint.g * w_new);
-        pile_tint[x].b = (unsigned char)(pile_tint[x].b * w_old + tint.b * w_new);
-        if (old <= 0.0f) pile_tint[x] = tint;
-        pile_tint[x].a = 230;
+        pile_tint_r[x] = pile_tint_r[x] * w_old + tr * w_new;
+        pile_tint_g[x] = pile_tint_g[x] * w_old + tg * w_new;
+        pile_tint_b[x] = pile_tint_b[x] * w_old + tb * w_new;
     }
 
     // …and lightly into nearby columns so one hit isn't a 1px stripe.
     for (int d = 1; d <= 3; d++) {
         float w = 0.35f / (float)d;
+        float inv = 1.0f - w;
         for (int s = -1; s <= 1; s += 2) {
             int n = x + s * d;
             if (n < 0 || n >= pile_w || pile[n] <= 0.0f) continue;
-            pile_tint[n].r = (unsigned char)(pile_tint[n].r * (1.0f - w) + tint.r * w);
-            pile_tint[n].g = (unsigned char)(pile_tint[n].g * (1.0f - w) + tint.g * w);
-            pile_tint[n].b = (unsigned char)(pile_tint[n].b * (1.0f - w) + tint.b * w);
-            pile_tint[n].a = 230;
+            pile_tint_r[n] = pile_tint_r[n] * inv + tr * w;
+            pile_tint_g[n] = pile_tint_g[n] * inv + tg * w;
+            pile_tint_b[n] = pile_tint_b[n] * inv + tb * w;
         }
     }
 
@@ -608,8 +636,11 @@ static void snow_init(void) {
     if (sw > 1920) sw = 1920;
     pile_w = sw;
     memset(pile, 0, sizeof(pile));
-    for (int i = 0; i < pile_w; i++)
-        pile_tint[i] = (Color){ 240, 245, 255, 230 };
+    for (int i = 0; i < pile_w; i++) {
+        pile_tint_r[i] = 240.0f;
+        pile_tint_g[i] = 245.0f;
+        pile_tint_b[i] = 255.0f;
+    }
 
     // Avg fall: speeds are 30..120 => mid 75 px/s; time = height / speed.
     float avg_speed = 75.0f;
@@ -680,7 +711,7 @@ static void snow_draw(void) {
     for (int x = 0; x < pile_w; x++) {
         if (pile[x] <= 0.0f) continue;
         int h = (int)pile[x];
-        DrawRectangle(x, sh - h, 1, h, pile_tint[x]);
+        DrawRectangle(x, sh - h, 1, h, pile_color_at(x));
     }
 
     // Obsidian (embedded / sinking)
