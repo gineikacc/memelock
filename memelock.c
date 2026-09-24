@@ -278,7 +278,7 @@ static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_resp
 #define LAVA_MAX 8
 #define LAVA_RADIUS 10.0f          // ~20px wide
 #define LAVA_MELT_COLS 10          // melts +/- this many columns
-#define LAVA_SPAWN_DENOM 5000      // 1 in 5000 flake respawns
+#define LAVA_SPAWN_DENOM 500       // 1 in 500 flake respawns (was 5000; "meteor" test rate)
 
 #define WATER_MAX 4000
 #define WATER_R 2.0f
@@ -288,6 +288,9 @@ static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_resp
 
 static float snow_speed_mult = 1.0f; // --snow-speed=N
 static int water_max = WATER_MAX;    // --water-max=N
+// TEMP (personal testing): keep water awake so flow is always visible.
+// Flip to false (or strip) to restore Minecraft-style sleep.
+static bool water_disable_sleep = true;
 
 typedef enum { SNOW_TINT_MIX, SNOW_TINT_WHITE, SNOW_TINT_ICE } SnowTintMode;
 static SnowTintMode snow_tint_mode = SNOW_TINT_MIX; // --snow-tint=
@@ -472,8 +475,22 @@ static void water_wake(int i) {
 static void water_sleep(int i) {
     if (i < 0 || i >= water_max || !water[i].used) return;
     if (!water[i].active) return;
+    if (water_disable_sleep) return; // TEMP testing: never settle-sleep
     water[i].active = false;
     // swap-remove from active list
+    for (int k = 0; k < water_active_n; k++) {
+        if (water_active_list[k] == i) {
+            water_active_list[k] = water_active_list[--water_active_n];
+            return;
+        }
+    }
+}
+
+// Forced deactivate (retire) — bypasses water_disable_sleep.
+static void water_force_sleep(int i) {
+    if (i < 0 || i >= water_max || !water[i].used) return;
+    if (!water[i].active) return;
+    water[i].active = false;
     for (int k = 0; k < water_active_n; k++) {
         if (water_active_list[k] == i) {
             water_active_list[k] = water_active_list[--water_active_n];
@@ -571,8 +588,9 @@ static void water_update(float dt) {
         if (water[i].x < 0) { water[i].x = 0; water[i].vx = 0; }
         if (water[i].x > sw - 1) { water[i].x = (float)sw - 1; water[i].vx = 0; }
 
-        float floor_y = ground_at(water[i].x) - WATER_R;
-        // Stack on active water below (same cell).
+        // Sink through the pile: floor is the screen bottom, not snow surface.
+        float floor_y = (float)sh - WATER_R;
+        // Stack on other active water (same cell).
         int cell = water_cell_of(water[i].x, water[i].y + WATER_R * 2);
         for (int j = water_cell_head[cell]; j != -1; j = water_cell_next[j]) {
             if (j == i) continue;
@@ -584,28 +602,38 @@ static void water_update(float dt) {
             }
         }
 
+        // Push water out of obsidian — never share cartesian space with it.
+        for (int o = 0; o < OBSIDIAN_MAX; o++) {
+            if (!obsidian[o].alive) continue;
+            float dx = water[i].x - obsidian[o].x;
+            float dy = water[i].y - obsidian[o].y;
+            float min_d = LAVA_RADIUS * 0.85f + WATER_R + 1.0f;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < min_d * min_d && d2 > 0.0001f) {
+                float d = sqrtf(d2);
+                float push = (min_d - d) + 20.0f * dt;
+                water[i].x += (dx / d) * push;
+                water[i].y += (dy / d) * push;
+                water[i].vx += (dx / d) * 60.0f;
+                water[i].vy += (dy / d) * 60.0f - 30.0f; // slight pop up/out
+                if (water[i].x < 0) water[i].x = 0;
+                if (water[i].x > sw - 1) water[i].x = (float)sw - 1;
+            }
+        }
+
         if (water[i].y > floor_y) {
             water[i].y = floor_y;
             water[i].vy = 0.0f;
 
-            // Flow sideways toward lower ground if slope allows.
-            float here = ground_at(water[i].x);
-            float left = ground_at(water[i].x - 6.0f);
-            float right = ground_at(water[i].x + 6.0f);
-            // Lower ground => larger y value (screen coords). Slide that way.
-            if (left > here + 1.0f || right > here + 1.0f) {
-                if (right > left) water[i].vx += 80.0f * dt * snow_speed_mult;
-                else             water[i].vx -= 80.0f * dt * snow_speed_mult;
-                // Still moving downhill — stay awake next frame.
-                continue;
-            }
-
-            // Settled: no lower neighbor within reach -> sleep (no math next frames).
+            // On screen floor: light lateral spread if neighbors crowd in.
+            float here = ground_at(water[i].x); // unused for sink; keep flat floor
+            (void)here;
+            // Settle-sleep only when allowed (disabled during personal testing).
             water_sleep(i);
         }
         // Off bottom (edge of screen): retire droplet.
         if (water[i].y > (float)sh + 8.0f) {
-            water_sleep(i);
+            water_force_sleep(i);
             water[i].used = false;
         }
     }
@@ -734,20 +762,60 @@ static void snow_init(void) {
 
 static void snow_update(float dt) {
     int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    // Rebuild water grid once so snow buoyancy can probe droplets cheaply.
+    water_build_grid();
+
     for (int i = 0; i < SNOW_COUNT; i++) {
         snow[i].phase += dt * snow_speed_mult;
-        snow[i].y += snow[i].speed * snow_speed_mult * dt;
-        snow[i].x += snow[i].drift * sinf(snow[i].phase) * dt;
+
+        // Buoyancy: if this flake is in/near water, float UP through it
+        // (and through piled snow above the water) instead of falling.
+        bool in_water = false;
+        {
+            int cell = water_cell_of(snow[i].x, snow[i].y);
+            // also probe cell slightly below (flakes move fast)
+            int cell2 = water_cell_of(snow[i].x, snow[i].y + WATER_CELL);
+            for (int pass = 0; pass < 2; pass++) {
+                int c = pass ? cell2 : cell;
+                for (int j = water_cell_head[c]; j != -1; j = water_cell_next[j]) {
+                    float dx = water[j].x - snow[i].x;
+                    float dy = water[j].y - snow[i].y;
+                    float rr = WATER_R + snow[i].size + 1.0f;
+                    if (dx * dx + dy * dy <= rr * rr) { in_water = true; break; }
+                }
+                if (in_water) break;
+            }
+        }
+
+        if (in_water) {
+            // Float up hard — pierces pile layers on the way out.
+            snow[i].y -= (120.0f + snow[i].speed * 0.5f) * snow_speed_mult * dt;
+            snow[i].x += snow[i].drift * 0.3f * sinf(snow[i].phase) * dt;
+        } else {
+            snow[i].y += snow[i].speed * snow_speed_mult * dt;
+            snow[i].x += snow[i].drift * sinf(snow[i].phase) * dt;
+        }
+
         if (snow[i].x < 0) snow[i].x += sw;
         if (snow[i].x > sw) snow[i].x -= sw;
 
-        // Landed: join the pile, then a fresh flake falls from the top.
-        if (snow[i].y >= ground_at(snow[i].x)) {
-            pile_add((int)snow[i].x, snow[i].size);
+        // Floated clear of screen top: recycle.
+        if (snow[i].y < -snow[i].size) {
             snow[i].y = -snow[i].size;
             snow[i].x = (float)GetRandomValue(0, sw);
             snow[i].tint = snow_pick_tint();
-            // Occasional lava droplet instead of a plain respawn.
+            continue;
+        }
+
+        // Landed: join the pile (only when NOT floating in water).
+        if (!in_water && snow[i].y >= ground_at(snow[i].x)) {
+            pile_add((int)snow[i].x, snow[i].size);
+            snow[i].y = -(float)GetRandomValue(1, sh);
+            snow[i].x = (float)GetRandomValue(0, sw);
+            snow[i].tint = snow_pick_tint();
+            // Occasional lava "meteor" instead of a plain respawn.
             if (GetRandomValue(1, LAVA_SPAWN_DENOM) == 1)
                 lava_spawn(snow[i].x);
         }
