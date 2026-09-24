@@ -768,9 +768,10 @@ static bool authenticate(const char *password) {
 }
 
 // --- Desktop snapshot background ---
-// Capture root BEFORE InitWindow (fullscreen would hide the desktop), then
-// Gaussian-blur + darken on CPU; drawn stretched under the snow each frame.
+// Capture + blur on CPU BEFORE InitWindow (fullscreen would hide the desktop).
+// Upload to a GL texture only AFTER InitWindow (needs a context).
 static Texture2D bg_tex = {0};
+static Image bg_img = {0};
 static bool bg_ready = false;
 
 static unsigned char xmask_to_u8(unsigned long pixel, unsigned long mask) {
@@ -849,6 +850,7 @@ static Image capture_root_image(void) {
 }
 
 // Call BEFORE InitWindow so the lock window is not in the shot.
+// Leaves CPU image in bg_img; upload happens later in bg_upload().
 static void bg_capture_and_process(void) {
     Image img = capture_root_image();
     if (!img.data) return;
@@ -862,12 +864,30 @@ static void bg_capture_and_process(void) {
 
     ImageBlurGaussian(&img, 12);
     ImageColorBrightness(&img, -45); // darken a bit
+    bg_img = img;
 
-    bg_tex = LoadTextureFromImage(img);
-    UnloadImage(img);
+    // Debug: sample a few pixels so we can see if capture came out black.
+    unsigned char *px = (unsigned char *)bg_img.data;
+    if (px && bg_img.width > 0 && bg_img.height > 0) {
+        size_t mid = ((size_t)bg_img.height / 2 * bg_img.width +
+                      (size_t)bg_img.width / 2) * 4;
+        fprintf(stderr,
+                "[memelock] bg: %dx%d mid RGB=(%u,%u,%u)\n",
+                bg_img.width, bg_img.height, px[mid], px[mid + 1], px[mid + 2]);
+    }
+}
+
+// Call AFTER InitWindow — needs the OpenGL context.
+static void bg_upload(void) {
+    if (!bg_img.data) return;
+    bg_tex = LoadTextureFromImage(bg_img);
+    UnloadImage(bg_img);
+    bg_img = (Image){0};
     if (bg_tex.id > 0) {
         bg_ready = true;
         SetTextureFilter(bg_tex, TEXTURE_FILTER_BILINEAR);
+        fprintf(stderr, "[memelock] bg: texture id=%u %dx%d\n",
+                bg_tex.id, bg_tex.width, bg_tex.height);
     } else {
         fprintf(stderr, "[memelock] bg: texture upload failed\n");
     }
@@ -921,11 +941,14 @@ int main(int argc, char **argv) {
     const int screen_width = 800;
     const int screen_height = 600;
 
-    // Snapshot desktop before the lock window covers it.
+    // Snapshot desktop before the lock window covers it (CPU only).
     bg_capture_and_process();
 
     SetConfigFlags(FLAG_FULLSCREEN_MODE | FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST);
     InitWindow(screen_width, screen_height, "mule");
+
+    // GL context exists — upload the pre-captured image as a texture.
+    bg_upload();
 
     int monitor = GetCurrentMonitor();
     SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
