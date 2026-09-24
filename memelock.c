@@ -272,7 +272,6 @@ static int pam_conv(int num_msg, const struct pam_message **msg, struct pam_resp
 //  * mouse dig/push    -> pump ButtonPress/Motion from our X grab, pile_remove/push
 //  * wind gusts, pile AO shading, settling color
 #define SNOW_COUNT 200
-#define PILE_MAX_FRACTION 0.30f // pile never buries the lock UI
 #define PILE_MAX_SLOPE 1.2f     // max height diff between adjacent columns (px)
 #define PILE_RELAX_ITERS 3
 
@@ -338,7 +337,7 @@ static float pile_tint_b[1920];
 static int pile_w = 0;
 
 static float pile_max(void) {
-    return (float)GetScreenHeight() * PILE_MAX_FRACTION;
+    return (float)GetScreenHeight(); // full screen height
 }
 
 static float ground_at(float x) {
