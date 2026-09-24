@@ -1099,13 +1099,13 @@ static LayoutCfg layout = {
     .margin = 16,
     .pad = 6,
     .col_gap = 2,
-    .row_gap = 0,
-    .block_gap = 2,
+    .row_gap = 0,      // between label/temp/pop rows (~0)
+    .block_gap = 8,    // only between hours block and days block
     .font_label = 24,
     .font_temp = 36,
     .font_pop = 18,
-    .row_h = 36,
-    .day_row_h = 32,
+    .row_h = 0,        // legacy: extra px after each hour row (0 = tight)
+    .day_row_h = 0,    // legacy: extra px after each day row
     .min_col_w = 40,
     .bg_alpha = 190,
 };
@@ -1150,12 +1150,12 @@ static void layout_defaults(void) {
     layout.pad = 6;
     layout.col_gap = 2;
     layout.row_gap = 0;
-    layout.block_gap = 2;
+    layout.block_gap = 8;
     layout.font_label = 24;
     layout.font_temp = 36;
     layout.font_pop = 18;
-    layout.row_h = 36;
-    layout.day_row_h = 32;
+    layout.row_h = 0;
+    layout.day_row_h = 0;
     layout.min_col_w = 40;
     layout.bg_alpha = 190;
 }
@@ -1169,8 +1169,8 @@ static void layout_clamp(void) {
     if (layout.font_label < 8) layout.font_label = 8;
     if (layout.font_temp < 8) layout.font_temp = 8;
     if (layout.font_pop < 8) layout.font_pop = 8;
-    if (layout.row_h < 12) layout.row_h = 12;
-    if (layout.day_row_h < 12) layout.day_row_h = 12;
+    if (layout.row_h < 0) layout.row_h = 0;
+    if (layout.day_row_h < 0) layout.day_row_h = 0;
     if (layout.min_col_w < 16) layout.min_col_w = 16;
     if (layout.bg_alpha < 0) layout.bg_alpha = 0;
     if (layout.bg_alpha > 255) layout.bg_alpha = 255;
@@ -1769,23 +1769,24 @@ static void weather_draw(int sw, int sh) {
     const int col_gap = layout.col_gap;
     const int row_gap = layout.row_gap;
     const int block_gap = layout.block_gap;
-    const int row_h = layout.row_h;
-    const int day_row_h = layout.day_row_h;
+    // Tight vertical: row pitch = font size + row_gap (+ legacy extra).
+    const int rh_lab = F_LABEL + row_gap + layout.row_h;
+    const int rh_tmp = F_TEMP + row_gap + layout.row_h;
+    const int rh_pop = F_POP + layout.row_h; // no gap after last row
+    const int dh_lab = F_LABEL + row_gap + layout.day_row_h;
+    const int dh_tmp = F_TEMP + row_gap + layout.day_row_h;
+    const int dh_pop = F_POP + layout.day_row_h;
 
     const Color c_label = { 170, 175, 185, 230 };
     const Color c_pop = { 100, 140, 200, 220 };
     const Color c_dim = { 90, 95, 105, 200 };
     Color ui_bg = { 10, 12, 18, (unsigned char)layout.bg_alpha };
 
-    // Hours block rows: label | temp (day only) | pop (day only)
-    // Night hours: label only (no temp, no pop).
-    // Days block rows: label | high | pop   (no lows)
-    const int hours_rows = 3;
-    const int days_rows = 3;
-    int hours_h = hours_rows * row_h + (hours_rows - 1) * row_gap;
-    int days_h = days_rows * day_row_h + (days_rows - 1) * row_gap;
-    int blocks_h = hours_h + block_gap + days_h;
-    int panel_content_h = blocks_h;
+    // Hours: label | temp (day) | pop (day)  — night: label only
+    // Days:  label | high | pop              — no lows
+    int hours_h = rh_lab + rh_tmp + rh_pop;
+    int days_h = dh_lab + dh_tmp + dh_pop;
+    int panel_content_h = hours_h + block_gap + days_h;
 
     if (!snap.ready) {
         int panel_w = w_measure("weather...", F_DIM) + pad * 2;
@@ -1847,33 +1848,35 @@ static void weather_draw(int sw, int sh) {
 
     // --- Hours ---
     int hy = cy;
+    int y_lab = hy;
+    int y_tmp = y_lab + rh_lab;
+    int y_pop = y_tmp + rh_tmp;
     for (int i = 0; i < W_HOURS; i++) {
         int x = cx + i * (col_w + col_gap);
-        w_cell(snap.hour_label[i], x, hy, col_w, row_h, F_LABEL, c_label);
+        w_cell(snap.hour_label[i], x, y_lab, col_w, rh_lab, F_LABEL, c_label);
         if (!snap.hour_is_day[i]) continue;
         char tbuf[16];
-        int ytemp = hy + row_h + row_gap;
-        int ypop = ytemp + row_h + row_gap;
         snprintf(tbuf, sizeof(tbuf), "%.0f", snap.hour_temp[i]);
-        w_cell(tbuf, x, ytemp, col_w, row_h, F_TEMP,
+        w_cell(tbuf, x, y_tmp, col_w, rh_tmp, F_TEMP,
                wmo_temp_color(snap.hour_code[i]));
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
-        w_cell(tbuf, x, ypop, col_w, row_h, F_POP, c_pop);
+        w_cell(tbuf, x, y_pop, col_w, rh_pop, F_POP, c_pop);
     }
 
     // --- Days (highs only) ---
     int dy = cy + hours_h + block_gap;
+    int d_lab = dy;
+    int d_tmp = d_lab + dh_lab;
+    int d_pop = d_tmp + dh_tmp;
     for (int i = 0; i < W_DAYS; i++) {
         int x = cx + i * (col_w + col_gap);
-        w_cell(snap.day_label[i], x, dy, col_w, day_row_h, F_LABEL, c_label);
+        w_cell(snap.day_label[i], x, d_lab, col_w, dh_lab, F_LABEL, c_label);
         char tbuf[16];
-        int yhigh = dy + day_row_h + row_gap;
-        int ypop = yhigh + day_row_h + row_gap;
         snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_max[i]);
-        w_cell(tbuf, x, yhigh, col_w, day_row_h, F_TEMP,
+        w_cell(tbuf, x, d_tmp, col_w, dh_tmp, F_TEMP,
                wmo_temp_color(snap.day_code[i]));
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
-        w_cell(tbuf, x, ypop, col_w, day_row_h, F_POP, c_pop);
+        w_cell(tbuf, x, d_pop, col_w, dh_pop, F_POP, c_pop);
     }
 
     (void)sw;
