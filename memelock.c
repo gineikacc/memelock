@@ -2064,15 +2064,23 @@ int main(int argc, char **argv) {
         }
         display[xpass_len] = '\0';
 
-        int text_size = 64;
+        // Default-font '*' ink (raylib sprite): rows 2..6 of 10 → center row 4.
+        // DrawText places the full 10px cell at y (offsetY=0), so the star sits
+        // high in the line box; shift down so the ink centers in the panel.
+        const int text_size = 64;
         int text_width = MeasureText(display, text_size);
-        // Always reserve room for at least one caret-wide box so it doesn't jump.
-        int box_text_w = text_width > 0 ? text_width : MeasureText("*", text_size);
-        int text_x = (sw - box_text_w) / 2;
-        int text_y = sh / 2;
-        DrawRectangle(text_x - ui_pad, text_y - ui_pad,
-                      box_text_w + ui_pad * 2, text_size + ui_pad * 2, ui_bg);
-        DrawText(display, (sw - text_width) / 2, text_y, text_size, WHITE);
+        int star_w = MeasureText("*", text_size);
+        int content_w = text_width > 0 ? text_width : star_w;
+        int content_x = (sw - content_w) / 2;
+        int box_h = text_size + ui_pad * 2;
+        int box_y = sh / 2 - ui_pad;
+        int ink_cy = text_size * 4 / 10; // center of * from DrawText y
+        int text_y = box_y + box_h / 2 - ink_cy;
+
+        DrawRectangle(content_x - ui_pad, box_y,
+                      content_w + ui_pad * 2, box_h, ui_bg);
+        if (text_width > 0)
+            DrawText(display, content_x, text_y, text_size, WHITE);
 
         if (xauth_failed) {
             const char *err = "wrong password";
