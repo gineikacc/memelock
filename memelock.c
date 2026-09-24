@@ -220,9 +220,9 @@ static void handle_xkey(XKeyEvent *ev) {
             break;
     }
 
-    // No password chars while modifiers are held (Shift/Ctrl/Alt/Super…).
-    // Ctrl already returned above; this catches Shift, Alt, Super, ISO mods.
-    if (ev->state & (ShiftMask | ControlMask | Mod1Mask | Mod4Mask | Mod5Mask))
+    // No password chars while Ctrl/Alt/Super are held (Shift is fine — needed
+    // for uppercase/symbols). Ctrl already returned above.
+    if (ev->state & (ControlMask | Mod1Mask | Mod4Mask | Mod5Mask))
         return;
 
     // Printable input (XLookupString already applied layout for Latin).
