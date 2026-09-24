@@ -220,7 +220,12 @@ static void handle_xkey(XKeyEvent *ev) {
             break;
     }
 
-    // Printable input (XLookupString already applied Shift/layout for Latin).
+    // No password chars while modifiers are held (Shift/Ctrl/Alt/Super…).
+    // Ctrl already returned above; this catches Shift, Alt, Super, ISO mods.
+    if (ev->state & (ShiftMask | ControlMask | Mod1Mask | Mod4Mask | Mod5Mask))
+        return;
+
+    // Printable input (XLookupString already applied layout for Latin).
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)buf[i];
         if (c < 32 || c == 127) continue;
