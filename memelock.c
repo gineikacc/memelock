@@ -376,6 +376,22 @@ static Color snow_pick_tint(void) {
 }
 
 // Avalanche: snow slides into neighboring valleys when slope exceeds repose.
+// Material that moves also mixes tint so heights don't band as stripes.
+static void pile_mix_tint(int from, int to, float amount) {
+    if (from < 0 || from >= pile_w || to < 0 || to >= pile_w) return;
+    if (amount <= 0.0f) return;
+    float dest_old = pile[to];
+    float total = dest_old + amount;
+    if (total <= 0.0f) return;
+    float w_old = dest_old / total;
+    float w_new = amount / total;
+    pile_tint[to].r = (unsigned char)(pile_tint[to].r * w_old + pile_tint[from].r * w_new);
+    pile_tint[to].g = (unsigned char)(pile_tint[to].g * w_old + pile_tint[from].g * w_new);
+    pile_tint[to].b = (unsigned char)(pile_tint[to].b * w_old + pile_tint[from].b * w_new);
+    if (dest_old <= 0.0f) pile_tint[to] = pile_tint[from];
+    pile_tint[to].a = 230;
+}
+
 static void pile_relax(void) {
     float max = pile_max();
     for (int it = 0; it < PILE_RELAX_ITERS; it++) {
@@ -387,6 +403,7 @@ static void pile_relax(void) {
                 if (pile[x] - t < 0.0f) t = pile[x];
                 if (pile[x + 1] + t > max) t = max - pile[x + 1];
                 if (t <= 0.0f) continue;
+                pile_mix_tint(x, x + 1, t);
                 pile[x] -= t;
                 pile[x + 1] += t;
                 moved = true;
@@ -395,6 +412,7 @@ static void pile_relax(void) {
                 if (pile[x + 1] - t < 0.0f) t = pile[x + 1];
                 if (pile[x] + t > max) t = max - pile[x];
                 if (t <= 0.0f) continue;
+                pile_mix_tint(x + 1, x, t);
                 pile[x + 1] -= t;
                 pile[x] += t;
                 moved = true;
@@ -402,6 +420,26 @@ static void pile_relax(void) {
         }
         if (!moved) break;
     }
+}
+
+// Light horizontal blur so single-column tint hits don't read as vertical lines.
+static void pile_smooth_tint(void) {
+    static Color tmp[1920];
+    if (pile_w < 3) return;
+    for (int x = 0; x < pile_w; x++) {
+        int l = x > 0 ? x - 1 : x;
+        int r = x < pile_w - 1 ? x + 1 : x;
+        // Only blend where both neighbors actually have snow.
+        if (pile[l] <= 0.0f || pile[x] <= 0.0f || pile[r] <= 0.0f) {
+            tmp[x] = pile_tint[x];
+            continue;
+        }
+        tmp[x].r = (unsigned char)((pile_tint[l].r + pile_tint[x].r * 2 + pile_tint[r].r) / 4);
+        tmp[x].g = (unsigned char)((pile_tint[l].g + pile_tint[x].g * 2 + pile_tint[r].g) / 4);
+        tmp[x].b = (unsigned char)((pile_tint[l].b + pile_tint[x].b * 2 + pile_tint[r].b) / 4);
+        tmp[x].a = 230;
+    }
+    memcpy(pile_tint, tmp, (size_t)pile_w * sizeof(Color));
 }
 
 // Heightmap ops — shared by flakes now; plows/meteors/mouse later.
@@ -412,7 +450,8 @@ static void pile_add(int x, float amount, Color tint) {
     float room = pile_max() - pile[x];
     if (amount > room) amount = room;
     if (amount <= 0.0f) return;
-    // Blend flake tint into the column so landed snow shows its color.
+
+    // Blend flake tint into the landing column…
     float old = pile[x];
     float total = old + amount;
     if (total > 0.0f) {
@@ -424,8 +463,23 @@ static void pile_add(int x, float amount, Color tint) {
         if (old <= 0.0f) pile_tint[x] = tint;
         pile_tint[x].a = 230;
     }
+
+    // …and lightly into nearby columns so one hit isn't a 1px stripe.
+    for (int d = 1; d <= 3; d++) {
+        float w = 0.35f / (float)d;
+        for (int s = -1; s <= 1; s += 2) {
+            int n = x + s * d;
+            if (n < 0 || n >= pile_w || pile[n] <= 0.0f) continue;
+            pile_tint[n].r = (unsigned char)(pile_tint[n].r * (1.0f - w) + tint.r * w);
+            pile_tint[n].g = (unsigned char)(pile_tint[n].g * (1.0f - w) + tint.g * w);
+            pile_tint[n].b = (unsigned char)(pile_tint[n].b * (1.0f - w) + tint.b * w);
+            pile_tint[n].a = 230;
+        }
+    }
+
     pile[x] += amount;
     pile_relax();
+    pile_smooth_tint();
 }
 
 PILE_HOOK static void pile_remove(int x, float amount) {
