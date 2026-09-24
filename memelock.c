@@ -767,6 +767,127 @@ static bool authenticate(const char *password) {
     return (ret == PAM_SUCCESS) && (ret2 == PAM_SUCCESS);
 }
 
+// --- Desktop snapshot background ---
+// Capture root BEFORE InitWindow (fullscreen would hide the desktop), then
+// Gaussian-blur + darken on CPU; drawn stretched under the snow each frame.
+static Texture2D bg_tex = {0};
+static bool bg_ready = false;
+
+static unsigned char xmask_to_u8(unsigned long pixel, unsigned long mask) {
+    if (mask == 0) return 0;
+    int shift = 0;
+    while (((mask >> shift) & 1UL) == 0UL) shift++;
+    unsigned long v = (pixel & mask) >> shift;
+    unsigned long max = mask >> shift;
+    if (max == 0) return 0;
+    return (unsigned char)((v * 255UL) / max);
+}
+
+static Image capture_root_image(void) {
+    Image img = {0};
+    Display *dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "[memelock] bg: XOpenDisplay failed\n");
+        return img;
+    }
+    int scr = DefaultScreen(dpy);
+    int w = DisplayWidth(dpy, scr);
+    int h = DisplayHeight(dpy, scr);
+    Window root = RootWindow(dpy, scr);
+    XImage *xi = XGetImage(dpy, root, 0, 0, (unsigned)w, (unsigned)h,
+                           AllPlanes, ZPixmap);
+    if (!xi) {
+        fprintf(stderr, "[memelock] bg: XGetImage failed\n");
+        XCloseDisplay(dpy);
+        return img;
+    }
+
+    img.width = w;
+    img.height = h;
+    img.mipmaps = 1;
+    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    img.data = malloc((size_t)w * (size_t)h * 4);
+    if (!img.data) {
+        XDestroyImage(xi);
+        XCloseDisplay(dpy);
+        img.data = NULL;
+        img.width = img.height = 0;
+        return img;
+    }
+
+    unsigned long rm = xi->red_mask;
+    unsigned long gm = xi->green_mask;
+    unsigned long bm = xi->blue_mask;
+    int bpp = xi->bits_per_pixel;
+    unsigned char *dst = (unsigned char *)img.data;
+
+    for (int y = 0; y < h; y++) {
+        const unsigned char *line =
+            (const unsigned char *)xi->data + (long)y * xi->bytes_per_line;
+        for (int x = 0; x < w; x++) {
+            unsigned long pixel = 0;
+            if (bpp == 32) {
+                memcpy(&pixel, line + (size_t)x * 4, 4);
+            } else if (bpp == 24) {
+                const unsigned char *p = line + (size_t)x * 3;
+                pixel = (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
+                        ((unsigned long)p[2] << 16);
+            } else {
+                pixel = XGetPixel(xi, x, y);
+            }
+            size_t o = ((size_t)y * (size_t)w + (size_t)x) * 4;
+            dst[o + 0] = xmask_to_u8(pixel, rm);
+            dst[o + 1] = xmask_to_u8(pixel, gm);
+            dst[o + 2] = xmask_to_u8(pixel, bm);
+            dst[o + 3] = 255;
+        }
+    }
+
+    XDestroyImage(xi);
+    XCloseDisplay(dpy);
+    return img;
+}
+
+// Call BEFORE InitWindow so the lock window is not in the shot.
+static void bg_capture_and_process(void) {
+    Image img = capture_root_image();
+    if (!img.data) return;
+
+    // Downscale large desktops so blur is cheap, then stretch at draw time.
+    if (img.width > 960) {
+        int nh = (int)((float)img.height * (960.0f / (float)img.width));
+        if (nh < 1) nh = 1;
+        ImageResize(&img, 960, nh);
+    }
+
+    ImageBlurGaussian(&img, 12);
+    ImageColorBrightness(&img, -45); // darken a bit
+
+    bg_tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    if (bg_tex.id > 0) {
+        bg_ready = true;
+        SetTextureFilter(bg_tex, TEXTURE_FILTER_BILINEAR);
+    } else {
+        fprintf(stderr, "[memelock] bg: texture upload failed\n");
+    }
+}
+
+static void bg_draw(int sw, int sh) {
+    if (!bg_ready) return;
+    DrawTexturePro(bg_tex,
+                   (Rectangle){ 0, 0, (float)bg_tex.width, (float)bg_tex.height },
+                   (Rectangle){ 0, 0, (float)sw, (float)sh },
+                   (Vector2){ 0, 0 }, 0.0f, WHITE);
+}
+
+static void bg_unload(void) {
+    if (bg_ready) {
+        UnloadTexture(bg_tex);
+        bg_ready = false;
+    }
+}
+
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n"
            "\n"
@@ -799,6 +920,9 @@ int main(int argc, char **argv) {
 
     const int screen_width = 800;
     const int screen_height = 600;
+
+    // Snapshot desktop before the lock window covers it.
+    bg_capture_and_process();
 
     SetConfigFlags(FLAG_FULLSCREEN_MODE | FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST);
     InitWindow(screen_width, screen_height, "mule");
@@ -870,6 +994,11 @@ int main(int argc, char **argv) {
 
         BeginDrawing();
         ClearBackground(BLACK);
+        {
+            int sw0 = GetScreenWidth();
+            int sh0 = GetScreenHeight();
+            bg_draw(sw0, sh0);
+        }
         snow_draw();
 
         int sw = GetScreenWidth();
@@ -927,6 +1056,7 @@ int main(int argc, char **argv) {
     }
 
     lock_ungrab();
+    bg_unload();
     CloseWindow();
     return 0;
 }
