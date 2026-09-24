@@ -36,7 +36,7 @@ While locked: **Ctrl+R** toggles the weather widget (Ctrl+W still deletes word).
 
 ## Weather widget (bottom-left)
 
-- **Open-Meteo** (no API key): next **12 hours** + **7 days** (no separate “today” row)
+- **Open-Meteo** (no API key): next **7 hours** + **7 days** (columns line up; no separate “today” row)
 - Hours: label · temp · rain% — **night hours show label only** (no temp, no %)
 - Days: label · **high** · rain% (no lows)
 - Temp digits colored by weather (clear=yellow, overcast=gray, rain=blue, snow=ice, storm=violet)

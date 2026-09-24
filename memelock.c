@@ -1050,7 +1050,7 @@ static void bg_unload(void) {
 // Compact fixed-cell layout, bottom-left. Ctrl+R toggles visibility.
 // Optional live layout file: --layout[=PATH] (off by default).
 
-#define W_HOURS 12
+#define W_HOURS 7  // matches W_DAYS so hour/day columns line up
 #define W_DAYS 7
 #define W_REFRESH_SEC 900
 
