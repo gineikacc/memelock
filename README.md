@@ -23,6 +23,8 @@ Depends on: raylib, X11 (+ Xrandr/Xinerama/Xi/Xcursor), PAM (`libpam`, `libpam_m
 | Flag | Meaning |
 |------|---------|
 | `-h`, `--help` | usage and exit |
+| `-b`, `-b=N` | background blur radius (default `5`) |
+| `-d`, `-d=N` | background darken, `-255..255` (default `-25`) |
 | `--snow-speed=N` | fall-speed multiplier (default `1.0`) |
 | `--snow-tint=MODE` | `white` \| `ice` \| `mix` (default `mix`) |
 

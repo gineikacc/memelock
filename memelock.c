@@ -773,6 +773,8 @@ static bool authenticate(const char *password) {
 static Texture2D bg_tex = {0};
 static Image bg_img = {0};
 static bool bg_ready = false;
+static int bg_blur = 5;     // -b / -b=N
+static int bg_darken = -25; // -d / -d=N (ImageColorBrightness scale)
 
 static unsigned char xmask_to_u8(unsigned long pixel, unsigned long mask) {
     if (mask == 0) return 0;
@@ -862,8 +864,13 @@ static void bg_capture_and_process(void) {
         ImageResize(&img, 960, nh);
     }
 
-    ImageBlurGaussian(&img, 12);
-    ImageColorBrightness(&img, -45); // darken a bit
+    if (bg_blur < 0) bg_blur = 0;
+    if (bg_blur > 256) bg_blur = 256;
+    if (bg_darken < -255) bg_darken = -255;
+    if (bg_darken > 255) bg_darken = 255;
+
+    ImageBlurGaussian(&img, bg_blur);
+    ImageColorBrightness(&img, bg_darken);
     bg_img = img;
 
     // Debug: sample a few pixels so we can see if capture came out black.
@@ -913,6 +920,8 @@ static void print_usage(const char *prog) {
            "\n"
            "Options:\n"
            "  -h, --help              show this help and exit\n"
+           "  -b, -b=N                background blur radius (default 5)\n"
+           "  -d, -d=N                background darken, -255..255 (default -25)\n"
            "  --snow-speed=N          snowfall speed multiplier (default 1.0)\n"
            "  --snow-tint=MODE        flake color: white | ice | mix (default mix)\n",
            prog);
@@ -923,6 +932,14 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            bg_blur = atoi(argv[++i]);
+        } else if (strncmp(argv[i], "-b=", 3) == 0) {
+            bg_blur = atoi(argv[i] + 3);
+        } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+            bg_darken = atoi(argv[++i]);
+        } else if (strncmp(argv[i], "-d=", 3) == 0) {
+            bg_darken = atoi(argv[i] + 3);
         } else if (strncmp(argv[i], "--snow-speed=", 13) == 0) {
             float v = strtof(argv[i] + 13, NULL);
             if (v > 0.0f) snow_speed_mult = v;
