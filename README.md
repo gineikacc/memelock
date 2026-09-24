@@ -25,8 +25,20 @@ Depends on: raylib, X11 (+ Xrandr/Xinerama/Xi/Xcursor), PAM (`libpam`, `libpam_m
 | `-h`, `--help` | usage and exit |
 | `-b`, `-b=N` | background blur radius (default `5`) |
 | `-d`, `-d=N` | background darken, `-255..255` (default `-25`) |
+| `--weather` / `--no-weather` | weather widget on/off at start (default **on**) |
+| `--city=NAME[,CC]` | weather location by city (`Vilnius`, `Paris,FR`) |
+| `--lat=` / `--lon=` | exact weather coordinates (wins over city) |
 | `--snow-speed=N` | fall-speed multiplier (default `1.0`) |
 | `--snow-tint=MODE` | `white` \| `ice` \| `mix` (default `mix`) |
+
+While locked: **Ctrl+R** toggles the weather widget (Ctrl+W still deletes word).
+
+## Weather widget (bottom-left)
+
+- **Open-Meteo** (no API key): current conditions, next **12 hours**, **7 days**
+- Each hour/day column: label, temp(s), rain chance %
+- Location order: `--lat/--lon` → `--city=` → cached IP geolocation (`ipapi.co`)
+- Cached under `~/.cache/memelock/`; refreshes ~every 15 min in a background thread
 
 Unknown flags print usage and exit 1.
 

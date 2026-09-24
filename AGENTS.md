@@ -20,7 +20,9 @@ Must stay `-Wall -Wextra` clean. No test suite. Binary name stays `memelock`.
 1. **X11 lock** — own `Display`, fullscreen hints, `XGrabKeyboard`/`XGrabPointer` on root, focus steal + retry at startup, re-grab every 0.5s.
 2. **Password** — `pump_x11_input` / `handle_xkey` / `ctrl_binds` / `authenticate` (PAM). Raylib does not receive keys.
 3. **Snow sim** — flakes, heightmap `pile[]`, float tint channels, `pile_relax` avalanche, lava → obsidian.
-4. **Main loop** — swallow `WindowShouldClose`, re-grab, pump X, auth, `snow_update`, draw scene + UI boxes.
+4. **Background** — root screenshot before `InitWindow`, float Gaussian + dither, upload after GL context.
+5. **Weather** — Open-Meteo via libcurl + json-c, pthread fetch, cache in `~/.cache/memelock/`, fixed-cell widget bottom-left. Ctrl+R toggles.
+6. **Main loop** — swallow `WindowShouldClose`, re-grab, pump X, auth, `snow_update`, draw scene + UI boxes + weather.
 
 ## Product decisions (respect these)
 
@@ -53,3 +55,5 @@ Must stay `-Wall -Wextra` clean. No test suite. Binary name stays `memelock`.
 - `./memelock --snow-speed=20` for fast piling / lava.
 - `./memelock --snow-tint=white` vs default `mix`.
 - Hold Super/Alt while typing: must not insert; Shift must insert.
+- `./memelock --city=Paris,France` for geocoded weather; `--no-weather` to hide widget.
+- Ctrl+R toggles widget; Ctrl+W still deletes word.

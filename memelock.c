@@ -9,6 +9,13 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <math.h>
+#include <curl/curl.h>
+#include <json-c/json.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#define MEMELOCK_VERSION "1.1.0"
 
 // raylib defines `Font`; X11 defines `Font` as XID -> rename X11's away
 #define Font X11Font
@@ -174,6 +181,14 @@ static void passwd_kill_word(void) {
     xauth_failed = false;
 }
 
+// Weather widget visibility (Ctrl+R). Full state lives with the weather section.
+static bool weather_enabled = true;
+static bool weather_visible = true;
+
+static void weather_toggle(void) {
+    if (weather_enabled) weather_visible = !weather_visible;
+}
+
 typedef void (*PasswdAction)(void);
 
 static const struct {
@@ -184,6 +199,7 @@ static const struct {
     { XK_U, passwd_clear_line, "clear line" },
     { XK_W, passwd_kill_word,  "delete word" },
     { XK_H, passwd_backspace,  "backspace" },
+    { XK_R, weather_toggle,    "toggle weather" },
 };
 
 static void handle_xkey(XKeyEvent *ev) {
@@ -1026,7 +1042,615 @@ static void bg_unload(void) {
     }
 }
 
-#define MEMELOCK_VERSION "1.0.0"
+// --- Weather widget (Open-Meteo, no API key) ---
+// Fixed-cell layout, bottom-left. Ctrl+R toggles visibility.
+
+#define W_HOURS 12
+#define W_DAYS 7
+#define W_COL_W 44
+#define W_COL_GAP 10
+#define W_MARGIN 16
+#define W_PAD 12
+#define W_REFRESH_SEC 900
+
+typedef struct {
+    float lat, lon;
+    char place[64];
+
+    float cur_temp;
+    int cur_code;
+    int cur_pop;
+
+    float hour_temp[W_HOURS];
+    int hour_code[W_HOURS];
+    int hour_pop[W_HOURS];
+    char hour_label[W_HOURS][8];
+
+    float day_min[W_DAYS];
+    float day_max[W_DAYS];
+    int day_code[W_DAYS];
+    int day_pop[W_DAYS];
+    char day_label[W_DAYS][4];
+
+    bool ready;
+    bool fetching;
+    double last_ok;
+} WeatherState;
+
+static WeatherState weather;
+static pthread_mutex_t weather_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t weather_thr;
+static bool weather_thr_started = false;
+static bool weather_shutdown = false;
+
+static float cli_lat = 0, cli_lon = 0;
+static bool cli_have_latlon = false;
+static char cli_city[128] = {0};
+
+static void weather_cache_path(char *out, size_t n, const char *file) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(out, n, "%s/.cache/memelock", home);
+    mkdir(out, 0755);
+    snprintf(out, n, "%s/.cache/memelock/%s", home, file);
+}
+
+static size_t http_write_cb(char *p, size_t s, size_t n, void *u) {
+    size_t m = s * n;
+    char **b = (char **)u;
+    size_t old = *b ? strlen(*b) : 0;
+    char *nb = (char *)realloc(*b, old + m + 1);
+    if (!nb) return 0;
+    memcpy(nb + old, p, m);
+    nb[old + m] = '\0';
+    *b = nb;
+    return m;
+}
+
+static char *http_get(const char *url, int timeout_s) {
+    char *body = NULL;
+    CURL *c = curl_easy_init();
+    if (!c) return NULL;
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, http_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, (long)timeout_s);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, (long)(timeout_s > 3 ? 3 : timeout_s));
+    curl_easy_setopt(c, CURLOPT_USERAGENT, "memelock/" MEMELOCK_VERSION);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    CURLcode r = curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    if (r != CURLE_OK) {
+        free(body);
+        return NULL;
+    }
+    return body;
+}
+
+static const char *wmo_label(int code) {
+    if (code == 0) return "clear";
+    if (code == 1) return "mainly clear";
+    if (code == 2) return "partly cloudy";
+    if (code == 3) return "overcast";
+    if (code == 45 || code == 48) return "fog";
+    if (code >= 51 && code <= 57) return "drizzle";
+    if (code >= 61 && code <= 67) return "rain";
+    if (code >= 71 && code <= 77) return "snow";
+    if (code >= 80 && code <= 82) return "showers";
+    if (code == 85 || code == 86) return "snow showers";
+    if (code >= 95) return "storm";
+    return "cloudy";
+}
+
+static const char *day_name(const char *iso) {
+    int y = 0, m = 0, d = 0;
+    if (!iso || sscanf(iso, "%d-%d-%d", &y, &m, &d) != 3) return "???";
+    static const char *names[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (m < 3) y -= 1;
+    int w = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+    return names[w];
+}
+
+static bool weather_parse_forecast(const char *json_text) {
+    if (!json_text || !json_text[0]) return false;
+    json_object *root = json_tokener_parse(json_text);
+    if (!root) return false;
+
+    json_object *cur = NULL, *hourly = NULL, *daily = NULL;
+    if (!json_object_object_get_ex(root, "current", &cur) ||
+        !json_object_object_get_ex(root, "hourly", &hourly) ||
+        !json_object_object_get_ex(root, "daily", &daily)) {
+        json_object_put(root);
+        return false;
+    }
+
+    WeatherState w;
+    memset(&w, 0, sizeof(w));
+    pthread_mutex_lock(&weather_mu);
+    w.lat = weather.lat;
+    w.lon = weather.lon;
+    memcpy(w.place, weather.place, sizeof(w.place));
+    pthread_mutex_unlock(&weather_mu);
+
+    json_object *o = NULL;
+    if (json_object_object_get_ex(cur, "temperature_2m", &o))
+        w.cur_temp = (float)json_object_get_double(o);
+    if (json_object_object_get_ex(cur, "weather_code", &o))
+        w.cur_code = json_object_get_int(o);
+    if (json_object_object_get_ex(cur, "precipitation_probability", &o) &&
+        json_object_get_type(o) == json_type_int)
+        w.cur_pop = json_object_get_int(o);
+
+    json_object *h_t = NULL, *h_c = NULL, *h_p = NULL, *h_time = NULL;
+    json_object_object_get_ex(hourly, "temperature_2m", &h_t);
+    json_object_object_get_ex(hourly, "weather_code", &h_c);
+    json_object_object_get_ex(hourly, "precipitation_probability", &h_p);
+    json_object_object_get_ex(hourly, "time", &h_time);
+    if (!h_t || !h_time) {
+        json_object_put(root);
+        return false;
+    }
+
+    int n = json_object_array_length(h_t);
+    int idx = 0;
+    const char *ct = NULL;
+    if (json_object_object_get_ex(cur, "time", &o)) ct = json_object_get_string(o);
+    if (ct && strlen(ct) >= 13) idx = atoi(ct + 11);
+    if (idx < 0) idx = 0;
+    if (idx + W_HOURS > n) idx = (n > W_HOURS) ? (n - W_HOURS) : 0;
+
+    for (int i = 0; i < W_HOURS; i++) {
+        int j = idx + i;
+        if (j >= n) break;
+        json_object *tj = json_object_array_get_idx(h_t, j);
+        w.hour_temp[i] = tj ? (float)json_object_get_double(tj) : 0;
+        if (h_c) {
+            json_object *cj = json_object_array_get_idx(h_c, j);
+            w.hour_code[i] = cj ? json_object_get_int(cj) : 0;
+        }
+        if (h_p) {
+            json_object *pj = json_object_array_get_idx(h_p, j);
+            if (pj && json_object_get_type(pj) == json_type_int)
+                w.hour_pop[i] = json_object_get_int(pj);
+        }
+        if (i == 0) {
+            snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "now");
+        } else {
+            json_object *timej = json_object_array_get_idx(h_time, j);
+            const char *ts = timej ? json_object_get_string(timej) : NULL;
+            if (ts && strlen(ts) >= 13)
+                snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "%s", ts + 11);
+            else
+                snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "+%d", i);
+        }
+    }
+
+    json_object *d_min = NULL, *d_max = NULL, *d_c = NULL, *d_p = NULL, *d_time = NULL;
+    json_object_object_get_ex(daily, "temperature_2m_min", &d_min);
+    json_object_object_get_ex(daily, "temperature_2m_max", &d_max);
+    json_object_object_get_ex(daily, "weather_code", &d_c);
+    json_object_object_get_ex(daily, "precipitation_probability_max", &d_p);
+    json_object_object_get_ex(daily, "time", &d_time);
+    int dn = d_min ? json_object_array_length(d_min) : 0;
+    if (dn > W_DAYS) dn = W_DAYS;
+    for (int i = 0; i < dn; i++) {
+        json_object *e = json_object_array_get_idx(d_min, i);
+        w.day_min[i] = e ? (float)json_object_get_double(e) : 0;
+        if (d_max) {
+            e = json_object_array_get_idx(d_max, i);
+            w.day_max[i] = e ? (float)json_object_get_double(e) : 0;
+        }
+        if (d_c) {
+            e = json_object_array_get_idx(d_c, i);
+            w.day_code[i] = e ? json_object_get_int(e) : 0;
+        }
+        if (d_p) {
+            e = json_object_array_get_idx(d_p, i);
+            if (e && json_object_get_type(e) == json_type_int)
+                w.day_pop[i] = json_object_get_int(e);
+        }
+        if (d_time) {
+            e = json_object_array_get_idx(d_time, i);
+            const char *iso = e ? json_object_get_string(e) : NULL;
+            snprintf(w.day_label[i], sizeof(w.day_label[i]), "%s", day_name(iso));
+        }
+    }
+
+    if (dn <= 0) {
+        json_object_put(root);
+        return false;
+    }
+
+    if (w.cur_pop <= 0 && h_p &&
+        idx < (int)json_object_array_length(h_p)) {
+        json_object *pj = json_object_array_get_idx(h_p, idx);
+        if (pj && json_object_get_type(pj) == json_type_int)
+            w.cur_pop = json_object_get_int(pj);
+    }
+
+    w.ready = true;
+    w.fetching = false;
+    w.last_ok = GetTime();
+
+    pthread_mutex_lock(&weather_mu);
+    weather = w;
+    pthread_mutex_unlock(&weather_mu);
+    json_object_put(root);
+    return true;
+}
+
+static void weather_save_cache(const char *json_text) {
+    char path[512];
+    weather_cache_path(path, sizeof(path), "weather.json");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputs(json_text, f);
+    fclose(f);
+}
+
+static bool weather_load_cache(void) {
+    char path[512];
+    weather_cache_path(path, sizeof(path), "weather.json");
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 2 * 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(f);
+        return false;
+    }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    buf[rd] = '\0';
+    fclose(f);
+    bool ok = weather_parse_forecast(buf);
+    free(buf);
+    return ok;
+}
+
+static void weather_save_loc(void) {
+    char path[512];
+    weather_cache_path(path, sizeof(path), "loc.txt");
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    pthread_mutex_lock(&weather_mu);
+    fprintf(f, "%.5f\n%.5f\n%s\n", weather.lat, weather.lon, weather.place);
+    pthread_mutex_unlock(&weather_mu);
+    fclose(f);
+}
+
+static bool weather_load_loc(void) {
+    char path[512];
+    weather_cache_path(path, sizeof(path), "loc.txt");
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    float lat = 0, lon = 0;
+    char place[64] = {0};
+    if (fscanf(f, "%f\n%f\n", &lat, &lon) != 2) {
+        fclose(f);
+        return false;
+    }
+    if (!fgets(place, sizeof(place), f)) place[0] = '\0';
+    fclose(f);
+    size_t L = strlen(place);
+    while (L > 0 && (place[L - 1] == '\n' || place[L - 1] == '\r')) place[--L] = '\0';
+    pthread_mutex_lock(&weather_mu);
+    weather.lat = lat;
+    weather.lon = lon;
+    snprintf(weather.place, sizeof(weather.place), "%s", place[0] ? place : "local");
+    pthread_mutex_unlock(&weather_mu);
+    return true;
+}
+
+static bool weather_set_place(float lat, float lon, const char *place) {
+    pthread_mutex_lock(&weather_mu);
+    weather.lat = lat;
+    weather.lon = lon;
+    snprintf(weather.place, sizeof(weather.place), "%.63s",
+             place && place[0] ? place : "local");
+    pthread_mutex_unlock(&weather_mu);
+    weather_save_loc();
+    return true;
+}
+
+static bool weather_geocode_city(const char *city) {
+    char *e = curl_easy_escape(NULL, city, 0);
+    if (!e) return false;
+    char url[512];
+    snprintf(url, sizeof(url),
+             "https://geocoding-api.open-meteo.com/v1/search?name=%s"
+             "&count=1&language=en&format=json",
+             e);
+    curl_free(e);
+
+    char *body = http_get(url, 6);
+    if (!body) return false;
+
+    json_object *root = json_tokener_parse(body);
+    free(body);
+    if (!root) return false;
+
+    json_object *results = NULL;
+    bool ok = false;
+    if (json_object_object_get_ex(root, "results", &results) &&
+        json_object_array_length(results) > 0) {
+        json_object *r0 = json_object_array_get_idx(results, 0);
+        json_object *la = NULL, *lo = NULL, *nm = NULL, *cc = NULL;
+        json_object_object_get_ex(r0, "latitude", &la);
+        json_object_object_get_ex(r0, "longitude", &lo);
+        json_object_object_get_ex(r0, "name", &nm);
+        json_object_object_get_ex(r0, "country_code", &cc);
+        if (la && lo) {
+            char label[96];
+            const char *n = nm ? json_object_get_string(nm) : city;
+            const char *c = cc ? json_object_get_string(cc) : "";
+            snprintf(label, sizeof(label), "%.40s, %.16s", n, c);
+            ok = weather_set_place((float)json_object_get_double(la),
+                                   (float)json_object_get_double(lo), label);
+        }
+    }
+    json_object_put(root);
+    return ok;
+}
+
+static bool weather_ip_locate(void) {
+    char *body = http_get("https://ipapi.co/json/", 6);
+    if (!body) body = http_get("https://ipwho.is/", 6);
+    if (!body) return false;
+
+    json_object *root = json_tokener_parse(body);
+    free(body);
+    if (!root) return false;
+
+    json_object *la = NULL, *lo = NULL, *city = NULL, *cc = NULL;
+    json_object_object_get_ex(root, "latitude", &la);
+    json_object_object_get_ex(root, "longitude", &lo);
+    json_object_object_get_ex(root, "city", &city);
+    if (!json_object_object_get_ex(root, "country_code", &cc))
+        json_object_object_get_ex(root, "country", &cc);
+
+    bool ok = false;
+    if (la && lo) {
+        char label[64];
+        const char *c = city ? json_object_get_string(city) : "";
+        const char *k = cc ? json_object_get_string(cc) : "";
+        if (c[0])
+            snprintf(label, sizeof(label), "%s, %s", c, k);
+        else
+            snprintf(label, sizeof(label), "ip");
+        ok = weather_set_place((float)json_object_get_double(la),
+                               (float)json_object_get_double(lo), label);
+    }
+    json_object_put(root);
+    return ok;
+}
+
+static bool weather_resolve_location(void) {
+    if (cli_have_latlon) {
+        char label[64];
+        snprintf(label, sizeof(label), "%.2f, %.2f", cli_lat, cli_lon);
+        return weather_set_place(cli_lat, cli_lon, label);
+    }
+    if (cli_city[0]) {
+        if (weather_geocode_city(cli_city)) return true;
+    }
+    if (weather_load_loc()) return true;
+    return weather_ip_locate();
+}
+
+static bool weather_fetch(void) {
+    float lat, lon;
+    pthread_mutex_lock(&weather_mu);
+    lat = weather.lat;
+    lon = weather.lon;
+    weather.fetching = true;
+    pthread_mutex_unlock(&weather_mu);
+
+    if (lat == 0.0f && lon == 0.0f) {
+        if (!weather_resolve_location()) {
+            pthread_mutex_lock(&weather_mu);
+            weather.fetching = false;
+            pthread_mutex_unlock(&weather_mu);
+            return false;
+        }
+        pthread_mutex_lock(&weather_mu);
+        lat = weather.lat;
+        lon = weather.lon;
+        pthread_mutex_unlock(&weather_mu);
+    }
+
+    char url[768];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast"
+             "?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,weather_code,apparent_temperature,"
+             "precipitation_probability"
+             "&hourly=temperature_2m,weather_code,precipitation_probability"
+             "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+             "precipitation_probability_max"
+             "&forecast_days=7&timezone=auto",
+             lat, lon);
+
+    char *body = http_get(url, 8);
+    if (!body) {
+        pthread_mutex_lock(&weather_mu);
+        weather.fetching = false;
+        pthread_mutex_unlock(&weather_mu);
+        fprintf(stderr, "[memelock] weather: fetch failed\n");
+        return false;
+    }
+
+    bool ok = weather_parse_forecast(body);
+    if (ok) weather_save_cache(body);
+    free(body);
+
+    pthread_mutex_lock(&weather_mu);
+    weather.fetching = false;
+    pthread_mutex_unlock(&weather_mu);
+    return ok;
+}
+
+static void *weather_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&weather_mu);
+        bool down = weather_shutdown;
+        double last = weather.last_ok;
+        bool ready = weather.ready;
+        bool fetching = weather.fetching;
+        pthread_mutex_unlock(&weather_mu);
+        if (down) break;
+
+        bool due = !ready || (!fetching && (last <= 0.0 || (GetTime() - last) >= W_REFRESH_SEC));
+        if (due) weather_fetch();
+
+        for (int i = 0; i < 50 && !weather_shutdown; i++)
+            usleep(20 * 1000);
+    }
+    return NULL;
+}
+
+static void weather_start(void) {
+    if (!weather_enabled) return;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    if (cli_have_latlon || cli_city[0])
+        weather_resolve_location();
+    else
+        weather_load_loc();
+    weather_load_cache();
+
+    weather_thr_started =
+        (pthread_create(&weather_thr, NULL, weather_thread, NULL) == 0);
+    if (!weather_thr_started)
+        fprintf(stderr, "[memelock] weather: thread create failed\n");
+}
+
+static void weather_stop(void) {
+    if (!weather_enabled) return;
+    pthread_mutex_lock(&weather_mu);
+    weather_shutdown = true;
+    pthread_mutex_unlock(&weather_mu);
+    if (weather_thr_started) {
+        pthread_join(weather_thr, NULL);
+        weather_thr_started = false;
+    }
+    curl_global_cleanup();
+}
+
+static void w_cell(const char *s, int x, int y, int w, int h, int font, Color c) {
+    int tw = MeasureText(s, font);
+    int tx = x + (w - tw) / 2;
+    int ty = y + (h - font) / 2;
+    if (tx < x) tx = x;
+    if (ty < y) ty = y;
+    DrawText(s, tx, ty, font, c);
+}
+
+static void weather_draw(int sw, int sh) {
+    if (!weather_enabled || !weather_visible) return;
+
+    WeatherState snap;
+    pthread_mutex_lock(&weather_mu);
+    snap = weather;
+    pthread_mutex_unlock(&weather_mu);
+
+    const Color ui_bg = { 10, 12, 18, 190 };
+    const Color c_title = { 140, 145, 155, 220 };
+    const Color c_label = { 170, 175, 185, 230 };
+    const Color c_temp = { 235, 238, 245, 255 };
+    const Color c_pop = { 100, 140, 200, 220 };
+    const Color c_dim = { 90, 95, 105, 200 };
+
+    const int now_h = 44;
+    const int title_h = 16;
+    const int row_h = 18;
+    const int day_row_h = 16;
+    const int gap = 8;
+    const int hours_h = title_h + row_h * 3;
+    const int days_h = title_h + day_row_h * 4;
+
+    int hours_w = W_HOURS * W_COL_W + (W_HOURS - 1) * W_COL_GAP;
+    int days_w = W_DAYS * W_COL_W + (W_DAYS - 1) * W_COL_GAP;
+    int content_w = hours_w > days_w ? hours_w : days_w;
+
+    char now_line[96];
+    if (snap.ready) {
+        snprintf(now_line, sizeof(now_line), "%.0f°  %s  %d%%",
+                 snap.cur_temp, wmo_label(snap.cur_code), snap.cur_pop);
+        int now_text_w = MeasureText(now_line, 20);
+        if (now_text_w + W_PAD * 2 > content_w)
+            content_w = now_text_w + W_PAD * 2;
+    } else {
+        snprintf(now_line, sizeof(now_line), "weather...");
+        int now_text_w = MeasureText(now_line, 16);
+        if (now_text_w + W_PAD * 2 > content_w)
+            content_w = now_text_w + W_PAD * 2;
+    }
+
+    int panel_w = content_w + W_PAD * 2;
+    int panel_h = W_PAD + now_h + gap + hours_h + gap + days_h + W_PAD;
+    int px = W_MARGIN;
+    int py = sh - W_MARGIN - panel_h;
+    if (py < 0) py = 0;
+
+    DrawRectangle(px, py, panel_w, panel_h, ui_bg);
+
+    int cx = px + W_PAD;
+    int cy = py + W_PAD;
+
+    if (!snap.ready) {
+        int tw = MeasureText(now_line, 16);
+        int tx = px + (panel_w - tw) / 2;
+        int ty = cy + (now_h - 16) / 2;
+        DrawText(now_line, tx, ty, 16, c_dim);
+        if (snap.fetching)
+            DrawText("...", tx + tw + 4, ty, 16, c_dim);
+        return;
+    }
+
+    // NOW
+    DrawText(now_line, cx, cy + (now_h - 20) / 2, 20, c_temp);
+
+    // HOURS: title + label/temp/pop rows in fixed columns
+    int hy = cy + now_h + gap;
+    DrawText("next", cx, hy, 14, c_title);
+    hy += title_h;
+    for (int i = 0; i < W_HOURS; i++) {
+        int x = cx + i * (W_COL_W + W_COL_GAP);
+        w_cell(snap.hour_label[i], x, hy, W_COL_W, row_h, 14, c_label);
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.hour_temp[i]);
+        w_cell(tbuf, x, hy + row_h, W_COL_W, row_h, 14, c_temp);
+        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
+        w_cell(tbuf, x, hy + row_h * 2, W_COL_W, row_h, 12, c_pop);
+    }
+
+    // DAYS: title + day/min/max/pop rows
+    int dy = cy + now_h + gap + hours_h + gap;
+    DrawText("week", cx, dy, 14, c_title);
+    dy += title_h;
+    for (int i = 0; i < W_DAYS; i++) {
+        int x = cx + i * (W_COL_W + W_COL_GAP);
+        w_cell(snap.day_label[i], x, dy, W_COL_W, day_row_h, 14, c_label);
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_min[i]);
+        w_cell(tbuf, x, dy + day_row_h, W_COL_W, day_row_h, 14, c_pop);
+        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_max[i]);
+        w_cell(tbuf, x, dy + day_row_h * 2, W_COL_W, day_row_h, 14, c_temp);
+        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
+        w_cell(tbuf, x, dy + day_row_h * 3, W_COL_W, day_row_h, 12, c_pop);
+    }
+
+    (void)days_h;
+    (void)sw;
+}
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n"
@@ -1035,8 +1659,14 @@ static void print_usage(const char *prog) {
            "  -h, --help              show this help and exit\n"
            "  -b, -b=N                background blur radius (default 5)\n"
            "  -d, -d=N                background darken, -255..255 (default -25)\n"
+           "  --weather               weather widget visible at start (default)\n"
+           "  --no-weather            disable weather widget\n"
+           "  --city=NAME[,CC]        city for weather (e.g. Vilnius or Paris,FR)\n"
+           "  --lat=LAT --lon=LON     exact coordinates for weather\n"
            "  --snow-speed=N          snowfall speed multiplier (default 1.0)\n"
-           "  --snow-tint=MODE        flake color: white | ice | mix (default mix)\n",
+           "  --snow-tint=MODE        flake color: white | ice | mix (default mix)\n"
+           "\n"
+           "While locked: Ctrl+R toggles the weather widget.\n",
            prog);
 }
 
@@ -1061,6 +1691,20 @@ int main(int argc, char **argv) {
             if (strcmp(t, "white") == 0) snow_tint_mode = SNOW_TINT_WHITE;
             else if (strcmp(t, "ice") == 0) snow_tint_mode = SNOW_TINT_ICE;
             else snow_tint_mode = SNOW_TINT_MIX;
+        } else if (strcmp(argv[i], "--weather") == 0) {
+            weather_enabled = true;
+            weather_visible = true;
+        } else if (strcmp(argv[i], "--no-weather") == 0) {
+            weather_enabled = false;
+            weather_visible = false;
+        } else if (strncmp(argv[i], "--city=", 7) == 0) {
+            snprintf(cli_city, sizeof(cli_city), "%s", argv[i] + 7);
+        } else if (strncmp(argv[i], "--lat=", 6) == 0) {
+            cli_lat = (float)strtod(argv[i] + 6, NULL);
+            if (cli_have_latlon || cli_lon != 0.0f) cli_have_latlon = true;
+        } else if (strncmp(argv[i], "--lon=", 6) == 0) {
+            cli_lon = (float)strtod(argv[i] + 6, NULL);
+            cli_have_latlon = true;
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1088,6 +1732,8 @@ int main(int argc, char **argv) {
     // (incl. kill client) never fire.
     lock_setup_x11();
     lock_grab_startup(); // bounded (~3s max), before first frame only
+
+    weather_start();
 
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
@@ -1205,6 +1851,9 @@ int main(int argc, char **argv) {
                       hint_width + 20, hint_size + 16, ui_bg);
         DrawText(hint, hint_x, hint_y, hint_size, GRAY);
 
+        // Weather widget — fixed layout, bottom-left (Ctrl+R toggles).
+        weather_draw(sw, sh);
+
         // Tiny, dull version tag — bottom-right, easy to miss on purpose.
         {
             const char *ver = MEMELOCK_VERSION;
@@ -1218,6 +1867,7 @@ int main(int argc, char **argv) {
     }
 
     lock_ungrab();
+    weather_stop();
     bg_unload();
     CloseWindow();
     return 0;
