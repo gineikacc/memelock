@@ -678,9 +678,22 @@ static bool authenticate(const char *password) {
     return (ret == PAM_SUCCESS) && (ret2 == PAM_SUCCESS);
 }
 
+static void print_usage(const char *prog) {
+    printf("Usage: %s [options]\n"
+           "\n"
+           "Options:\n"
+           "  -h, --help              show this help and exit\n"
+           "  --snow-speed=N          snowfall speed multiplier (default 1.0)\n"
+           "  --snow-tint=MODE        flake color: white | ice | mix (default mix)\n",
+           prog);
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--snow-speed=", 13) == 0) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strncmp(argv[i], "--snow-speed=", 13) == 0) {
             float v = strtof(argv[i] + 13, NULL);
             if (v > 0.0f) snow_speed_mult = v;
         } else if (strncmp(argv[i], "--snow-tint=", 12) == 0) {
@@ -688,6 +701,10 @@ int main(int argc, char **argv) {
             if (strcmp(t, "white") == 0) snow_tint_mode = SNOW_TINT_WHITE;
             else if (strcmp(t, "ice") == 0) snow_tint_mode = SNOW_TINT_ICE;
             else snow_tint_mode = SNOW_TINT_MIX;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
@@ -695,7 +712,7 @@ int main(int argc, char **argv) {
     const int screen_height = 600;
 
     SetConfigFlags(FLAG_FULLSCREEN_MODE | FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST);
-    InitWindow(screen_width, screen_height, "memelock");
+    InitWindow(screen_width, screen_height, "mule");
 
     int monitor = GetCurrentMonitor();
     SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
@@ -772,7 +789,7 @@ int main(int argc, char **argv) {
         const int ui_pad = 18;
         const Color ui_bg = { 10, 12, 18, 190 };
 
-        const char *prompt = "memelock";
+        const char *prompt = "mule";
         int prompt_size = 80;
         int prompt_width = MeasureText(prompt, prompt_size);
         int prompt_x = (sw - prompt_width) / 2;
