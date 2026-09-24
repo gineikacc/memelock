@@ -53,17 +53,15 @@ margin=16
 pad=6
 col_gap=2
 row_gap=0
-block_gap=2
+block_gap=8
 font_label=24
 font_temp=36
 font_pop=18
-row_h=36
-day_row_h=32
 min_col_w=40
 bg_alpha=190
 ```
 
-Unknown keys are ignored; missing file → built-in compact defaults.
+Rows are font-tight (pitch = font size + `row_gap`). `block_gap` is the only gap between the hours and days columns. `row_h` / `day_row_h` still accepted as extra px after each row (default 0). Unknown keys are ignored; missing file → built-in defaults.
 
 Unknown flags print usage and exit 1.
 
