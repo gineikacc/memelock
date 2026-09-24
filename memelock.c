@@ -304,6 +304,25 @@ static struct {
     Color tint;
 } snow[SNOW_COUNT];
 
+// Gradual ramp-in: 1 flake at first, then one per interval until SNOW_COUNT.
+// Interval = avg fall time / limit (spawns spread over ~one fall duration).
+static int snow_active = 0;
+static float snow_spawn_timer = 0.0f;
+static float snow_spawn_interval = 0.0f;
+
+static Color snow_pick_tint(void); // defined below
+
+static void snow_place_at_top(int i) {
+    int sw = GetScreenWidth();
+    snow[i].speed = 30.0f + (float)GetRandomValue(0, 90);
+    snow[i].size = 1.0f + (float)GetRandomValue(0, 3);
+    snow[i].drift = 10.0f + (float)GetRandomValue(0, 30);
+    snow[i].phase = (float)GetRandomValue(0, 628) / 100.0f;
+    snow[i].tint = snow_pick_tint();
+    snow[i].x = (float)GetRandomValue(0, sw);
+    snow[i].y = -snow[i].size;
+}
+
 // Lava: falls, melts snow under it, becomes obsidian at screen bottom.
 static struct {
     bool alive;
@@ -742,16 +761,27 @@ static void snow_init(void) {
     if (sw > 1920) sw = 1920;
     pile_w = sw;
     memset(pile, 0, sizeof(pile));
-    for (int i = 0; i < SNOW_COUNT; i++) {
-        snow[i].x = (float)GetRandomValue(0, sw);
-        // Staggered above the screen: starts empty, first flakes arrive over time.
-        snow[i].y = -(float)GetRandomValue(1, GetScreenHeight());
-        snow[i].speed = 30.0f + (float)GetRandomValue(0, 90);
-        snow[i].size = 1.0f + (float)GetRandomValue(0, 3);
-        snow[i].drift = 10.0f + (float)GetRandomValue(0, 30);
-        snow[i].phase = (float)GetRandomValue(0, 628) / 100.0f;
+
+    // Avg fall: speeds are 30..120 => mid 75 px/s; time = height / speed.
+    float avg_speed = 75.0f;
+    float avg_fall_time = (float)GetScreenHeight() / avg_speed;
+    // Tiny gap between spawns; total ramp ≈ one fall duration.
+    snow_spawn_interval = avg_fall_time / (float)SNOW_COUNT;
+    snow_spawn_timer = 0.0f;
+
+    // Only the first flake exists on frame 1; rest activate over time.
+    snow_active = 1;
+    snow_place_at_top(0);
+    for (int i = 1; i < SNOW_COUNT; i++) {
+        snow[i].x = 0;
+        snow[i].y = -100000.0f; // dormant far offscreen
+        snow[i].speed = 0;
+        snow[i].size = 1;
+        snow[i].drift = 0;
+        snow[i].phase = 0;
         snow[i].tint = snow_pick_tint();
     }
+
     for (int i = 0; i < LAVA_MAX; i++) lava[i].alive = false;
     for (int i = 0; i < OBSIDIAN_MAX; i++) obsidian[i].alive = false;
     memset(water, 0, sizeof(water));
@@ -764,10 +794,19 @@ static void snow_update(float dt) {
     int sw = GetScreenWidth();
     int sh = GetScreenHeight();
 
+    // Ramp-in: activate one more flake per interval until the limit.
+    snow_spawn_timer += dt * snow_speed_mult;
+    if (snow_active < SNOW_COUNT && snow_spawn_timer >= snow_spawn_interval) {
+        snow_spawn_timer -= snow_spawn_interval;
+        if (snow_spawn_timer > snow_spawn_interval) snow_spawn_timer = 0;
+        snow_place_at_top(snow_active);
+        snow_active++;
+    }
+
     // Rebuild water grid once so snow buoyancy can probe droplets cheaply.
     water_build_grid();
 
-    for (int i = 0; i < SNOW_COUNT; i++) {
+    for (int i = 0; i < snow_active; i++) {
         snow[i].phase += dt * snow_speed_mult;
 
         // Buoyancy: if this flake is in/near water, float UP through it
@@ -855,8 +894,8 @@ static void snow_draw(void) {
                     (Color){ 40, 110, 255, 200 });
     }
 
-    // Falling snow
-    for (int i = 0; i < SNOW_COUNT; i++) {
+    // Falling snow (only ramped-in flakes)
+    for (int i = 0; i < snow_active; i++) {
         Color c = snow[i].tint;
         c.a = (unsigned char)(120 + (int)snow[i].size * 30);
         DrawCircleV((Vector2){ snow[i].x, snow[i].y }, snow[i].size, c);
