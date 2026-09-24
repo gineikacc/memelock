@@ -209,11 +209,14 @@ static void handle_xkey(XKeyEvent *ev) {
 
     // Ctrl combos first: match bind table, swallow everything else
     // (so e.g. Ctrl+C / Ctrl+Z can never do anything here).
+    // Normalize keysym to lowercase so XK_R / XK_r both match XK_R binds.
     if (ev->state & ControlMask) {
         KeySym k = ks;
-        if (k >= XK_A && k <= XK_Z) k += (XK_a - XK_A); // Ctrl+Shift+X == Ctrl+X
+        if (k >= XK_A && k <= XK_Z) k += (XK_a - XK_A);
         for (unsigned i = 0; i < sizeof(ctrl_binds) / sizeof(ctrl_binds[0]); i++) {
-            if (k == ctrl_binds[i].ks) {
+            KeySym bk = ctrl_binds[i].ks;
+            if (bk >= XK_A && bk <= XK_Z) bk += (XK_a - XK_A);
+            if (k == bk) {
                 ctrl_binds[i].fn();
                 return;
             }
@@ -1048,9 +1051,9 @@ static void bg_unload(void) {
 #define W_HOURS 12
 #define W_DAYS 7
 #define W_COL_W 44
-#define W_COL_GAP 10
+#define W_COL_GAP 4
 #define W_MARGIN 16
-#define W_PAD 12
+#define W_PAD 8
 #define W_REFRESH_SEC 900
 
 typedef struct {
@@ -1627,50 +1630,50 @@ static void weather_draw(int sw, int sh) {
     const int F_TEMP = 42;
     const int F_DIM = 32;
 
-    const int now_h = 96;
-    const int title_h = 40;
-    const int row_h = 56;
-    const int day_row_h = 52;
-    const int gap = 14;
+    const int now_h = 78;
+    const int title_h = 34;
+    const int row_h = 50;
+    const int day_row_h = 46;
+    const int gap = 2;
     const int hours_h = title_h + row_h * 3;
     const int days_h = title_h + day_row_h * 4;
 
     // Columns sized to the largest cell string at its font.
-    int col_w = 64;
+    int col_w = 56;
     for (int i = 0; i < W_HOURS; i++) {
         int w = w_measure(snap.hour_label[i], F_LABEL);
         char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.ready ? snap.hour_temp[i] : 0);
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.ready ? snap.hour_temp[i] : 0);
         int wt = w_measure(tbuf, F_TEMP);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.hour_pop[i] : 100);
         int wp = w_measure(tbuf, F_POP);
         int m = w;
         if (wt > m) m = wt;
         if (wp > m) m = wp;
-        if (m + 16 > col_w) col_w = m + 16;
+        if (m + 8 > col_w) col_w = m + 8;
     }
     for (int i = 0; i < W_DAYS; i++) {
         int w = w_measure(snap.day_label[i], F_LABEL);
         char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.ready ? snap.day_max[i] : 0);
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.ready ? snap.day_max[i] : 0);
         int wt = w_measure(tbuf, F_TEMP);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.day_pop[i] : 100);
         int wp = w_measure(tbuf, F_POP);
         int m = w;
         if (wt > m) m = wt;
         if (wp > m) m = wp;
-        if (m + 16 > col_w) col_w = m + 16;
+        if (m + 8 > col_w) col_w = m + 8;
     }
-    if (col_w < 56) col_w = 56;
+    if (col_w < 48) col_w = 48;
 
-    const int col_gap = 14;
+    const int col_gap = 4;
     int hours_w = W_HOURS * col_w + (W_HOURS - 1) * col_gap;
     int days_w = W_DAYS * col_w + (W_DAYS - 1) * col_gap;
     int content_w = hours_w > days_w ? hours_w : days_w;
 
     char now_line[96];
     if (snap.ready) {
-        snprintf(now_line, sizeof(now_line), "%.0f°  %s  %d%%",
+        snprintf(now_line, sizeof(now_line), "%.0f  %s  %d%%",
                  snap.cur_temp, wmo_label(snap.cur_code), snap.cur_pop);
         int now_text_w = w_measure(now_line, F_NOW);
         if (now_text_w + W_PAD * 2 > content_w)
@@ -1714,7 +1717,7 @@ static void weather_draw(int sw, int sh) {
         int x = cx + i * (col_w + col_gap);
         w_cell(snap.hour_label[i], x, hy, col_w, row_h, F_LABEL, c_label);
         char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.hour_temp[i]);
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.hour_temp[i]);
         w_cell(tbuf, x, hy + row_h, col_w, row_h, F_TEMP, c_temp);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
         w_cell(tbuf, x, hy + row_h * 2, col_w, row_h, F_POP, c_pop);
@@ -1728,9 +1731,9 @@ static void weather_draw(int sw, int sh) {
         int x = cx + i * (col_w + col_gap);
         w_cell(snap.day_label[i], x, dy, col_w, day_row_h, F_LABEL, c_label);
         char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_min[i]);
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_min[i]);
         w_cell(tbuf, x, dy + day_row_h, col_w, day_row_h, F_TEMP, c_pop);
-        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_max[i]);
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_max[i]);
         w_cell(tbuf, x, dy + day_row_h * 2, col_w, day_row_h, F_TEMP, c_temp);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
         w_cell(tbuf, x, dy + day_row_h * 3, col_w, day_row_h, F_POP, c_pop);
