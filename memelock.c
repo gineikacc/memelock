@@ -1026,6 +1026,8 @@ static void bg_unload(void) {
     }
 }
 
+#define MEMELOCK_VERSION "1.0.0"
+
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n"
            "\n"
@@ -1202,6 +1204,15 @@ int main(int argc, char **argv) {
         DrawRectangle(hint_x - 10, hint_y - 8,
                       hint_width + 20, hint_size + 16, ui_bg);
         DrawText(hint, hint_x, hint_y, hint_size, GRAY);
+
+        // Tiny, dull version tag — bottom-right, easy to miss on purpose.
+        {
+            const char *ver = MEMELOCK_VERSION;
+            int ver_size = 10;
+            int ver_w = MeasureText(ver, ver_size);
+            DrawText(ver, sw - ver_w - 10, sh - 18, ver_size,
+                     (Color){ 70, 74, 82, 160 });
+        }
 
         EndDrawing();
     }
