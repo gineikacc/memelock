@@ -774,7 +774,116 @@ static Texture2D bg_tex = {0};
 static Image bg_img = {0};
 static bool bg_ready = false;
 static int bg_blur = 5;     // -b / -b=N
-static int bg_darken = -25; // -d / -d=N (ImageColorBrightness scale)
+static int bg_darken = -25; // -d / -d=N (fraction of 255)
+
+// Separable Gaussian in float, then darken + blue-noise-ish dither when
+// quantizing back to 8-bit. raylib's ImageBlurGaussian is a box-blur
+// approximation and ImageColorBrightness truncates — both band gradients.
+static void bg_gaussian_blur(Image *img, int radius, float darken) {
+    if (!img || !img->data) return;
+    int w = img->width, h = img->height;
+    if (w < 1 || h < 1) return;
+    if (radius < 1) radius = 1;
+    if (radius > 64) radius = 64;
+
+    // 1D Gaussian kernel, sigma ≈ radius/2 (keeps a soft but visible blur)
+    int diam = radius * 2 + 1;
+    float *kern = (float *)malloc((size_t)diam * sizeof(float));
+    float *tmp = (float *)malloc((size_t)w * (size_t)h * 4 * sizeof(float));
+    float *src = (float *)malloc((size_t)w * (size_t)h * 4 * sizeof(float));
+    if (!kern || !tmp || !src) {
+        free(kern);
+        free(tmp);
+        free(src);
+        return;
+    }
+
+    float sigma = (float)radius * 0.5f;
+    float sum = 0.0f;
+    float s2 = 2.0f * sigma * sigma;
+    for (int i = -radius; i <= radius; i++) {
+        float v = expf(-(float)(i * i) / s2);
+        kern[i + radius] = v;
+        sum += v;
+    }
+    for (int i = 0; i < diam; i++) kern[i] /= sum;
+
+    unsigned char *px = (unsigned char *)img->data;
+    size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; i++) {
+        src[i * 4 + 0] = (float)px[i * 4 + 0];
+        src[i * 4 + 1] = (float)px[i * 4 + 1];
+        src[i * 4 + 2] = (float)px[i * 4 + 2];
+        src[i * 4 + 3] = 255.0f; // force opaque
+    }
+
+    // Horizontal
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float r = 0, g = 0, b = 0;
+            for (int t = -radius; t <= radius; t++) {
+                int xx = x + t;
+                if (xx < 0) xx = 0;
+                if (xx >= w) xx = w - 1;
+                float kv = kern[t + radius];
+                size_t o = ((size_t)y * (size_t)w + (size_t)xx) * 4;
+                r += src[o + 0] * kv;
+                g += src[o + 1] * kv;
+                b += src[o + 2] * kv;
+            }
+            size_t o = ((size_t)y * (size_t)w + (size_t)x) * 4;
+            tmp[o + 0] = r;
+            tmp[o + 1] = g;
+            tmp[o + 2] = b;
+            tmp[o + 3] = 255.0f;
+        }
+    }
+
+    // Vertical + darken + dithered quantize
+    // hash-based ±0.5 LSB dither breaks up 8-bit banding on smooth gradients
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float r = 0, g = 0, b = 0;
+            for (int t = -radius; t <= radius; t++) {
+                int yy = y + t;
+                if (yy < 0) yy = 0;
+                if (yy >= h) yy = h - 1;
+                float kv = kern[t + radius];
+                size_t o = ((size_t)yy * (size_t)w + (size_t)x) * 4;
+                r += tmp[o + 0] * kv;
+                g += tmp[o + 1] * kv;
+                b += tmp[o + 2] * kv;
+            }
+            r *= darken;
+            g *= darken;
+            b *= darken;
+
+            unsigned hx = (unsigned)(x * 73856093u) ^ (unsigned)(y * 19349663u);
+            float dith = ((float)(hx & 1023u) / 1023.0f) - 0.5f;
+
+            r += dith;
+            g += dith;
+            b += dith;
+
+            if (r < 0) r = 0;
+            if (r > 255) r = 255;
+            if (g < 0) g = 0;
+            if (g > 255) g = 255;
+            if (b < 0) b = 0;
+            if (b > 255) b = 255;
+
+            size_t o = ((size_t)y * (size_t)w + (size_t)x) * 4;
+            px[o + 0] = (unsigned char)(r + 0.5f);
+            px[o + 1] = (unsigned char)(g + 0.5f);
+            px[o + 2] = (unsigned char)(b + 0.5f);
+            px[o + 3] = 255;
+        }
+    }
+
+    free(kern);
+    free(tmp);
+    free(src);
+}
 
 static unsigned char xmask_to_u8(unsigned long pixel, unsigned long mask) {
     if (mask == 0) return 0;
@@ -865,12 +974,14 @@ static void bg_capture_and_process(void) {
     }
 
     if (bg_blur < 0) bg_blur = 0;
-    if (bg_blur > 256) bg_blur = 256;
+    if (bg_blur > 64) bg_blur = 64;
     if (bg_darken < -255) bg_darken = -255;
     if (bg_darken > 255) bg_darken = 255;
 
-    ImageBlurGaussian(&img, bg_blur);
-    ImageColorBrightness(&img, bg_darken);
+    // darken: -25 means multiply by (1 - 25/255) ≈ 0.90, matching prior feel
+    float darken = 1.0f + ((float)bg_darken / 255.0f);
+    if (darken < 0.0f) darken = 0.0f;
+    bg_gaussian_blur(&img, bg_blur, darken);
     bg_img = img;
 
     // Debug: sample a few pixels so we can see if capture came out black.
