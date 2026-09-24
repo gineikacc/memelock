@@ -771,7 +771,6 @@ int main(int argc, char **argv) {
 
         const int ui_pad = 18;
         const Color ui_bg = { 10, 12, 18, 190 };
-        const Color ui_border = { 40, 48, 64, 220 };
 
         const char *prompt = "memelock";
         int prompt_size = 80;
@@ -780,8 +779,6 @@ int main(int argc, char **argv) {
         int prompt_y = sh / 2 - 140;
         DrawRectangle(prompt_x - ui_pad, prompt_y - ui_pad,
                       prompt_width + ui_pad * 2, prompt_size + ui_pad * 2, ui_bg);
-        DrawRectangleLines(prompt_x - ui_pad, prompt_y - ui_pad,
-                           prompt_width + ui_pad * 2, prompt_size + ui_pad * 2, ui_border);
         DrawText(prompt, prompt_x, prompt_y, prompt_size, RAYWHITE);
 
         char display[128];
@@ -798,8 +795,6 @@ int main(int argc, char **argv) {
         int text_y = sh / 2;
         DrawRectangle(text_x - ui_pad, text_y - ui_pad,
                       box_text_w + ui_pad * 2, text_size + ui_pad * 2, ui_bg);
-        DrawRectangleLines(text_x - ui_pad, text_y - ui_pad,
-                           box_text_w + ui_pad * 2, text_size + ui_pad * 2, ui_border);
         DrawText(display, (sw - text_width) / 2, text_y, text_size, WHITE);
 
         if (xauth_failed) {
@@ -810,9 +805,6 @@ int main(int argc, char **argv) {
             int err_y = sh / 2 + 110;
             DrawRectangle(err_x - ui_pad, err_y - ui_pad,
                           err_width + ui_pad * 2, err_size + ui_pad * 2, ui_bg);
-            DrawRectangleLines(err_x - ui_pad, err_y - ui_pad,
-                               err_width + ui_pad * 2, err_size + ui_pad * 2,
-                               (Color){ 120, 30, 30, 220 });
             DrawText(err, err_x, err_y, err_size, RED);
         }
 
@@ -823,8 +815,6 @@ int main(int argc, char **argv) {
         int hint_y = sh - 60;
         DrawRectangle(hint_x - 10, hint_y - 8,
                       hint_width + 20, hint_size + 16, ui_bg);
-        DrawRectangleLines(hint_x - 10, hint_y - 8,
-                           hint_width + 20, hint_size + 16, ui_border);
         DrawText(hint, hint_x, hint_y, hint_size, GRAY);
 
         EndDrawing();
