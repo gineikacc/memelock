@@ -14,8 +14,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 
-#define MEMELOCK_VERSION "1.1.0"
+#define MEMELOCK_VERSION "1.2.0"
 
 // raylib defines `Font`; X11 defines `Font` as XID -> rename X11's away
 #define Font X11Font
@@ -1046,14 +1047,11 @@ static void bg_unload(void) {
 }
 
 // --- Weather widget (Open-Meteo, no API key) ---
-// Fixed-cell layout, bottom-left. Ctrl+R toggles visibility.
+// Compact fixed-cell layout, bottom-left. Ctrl+R toggles visibility.
+// Optional live layout file: --layout[=PATH] (off by default).
 
 #define W_HOURS 12
 #define W_DAYS 7
-#define W_COL_W 44
-#define W_COL_GAP 4
-#define W_MARGIN 16
-#define W_PAD 8
 #define W_REFRESH_SEC 900
 
 typedef struct {
@@ -1067,6 +1065,7 @@ typedef struct {
     float hour_temp[W_HOURS];
     int hour_code[W_HOURS];
     int hour_pop[W_HOURS];
+    int hour_is_day[W_HOURS]; // 1 day, 0 night; default 1 if missing
     char hour_label[W_HOURS][8];
 
     float day_min[W_DAYS];
@@ -1080,6 +1079,42 @@ typedef struct {
     double last_ok;
 } WeatherState;
 
+// Tunable layout — defaults are compact; live-reloaded from file if enabled.
+typedef struct {
+    int margin;
+    int pad;
+    int col_gap;
+    int row_gap;
+    int block_gap;
+    int font_label;
+    int font_temp;
+    int font_pop;
+    int row_h;
+    int day_row_h;
+    int min_col_w;
+    int bg_alpha;
+} LayoutCfg;
+
+static LayoutCfg layout = {
+    .margin = 16,
+    .pad = 6,
+    .col_gap = 2,
+    .row_gap = 0,
+    .block_gap = 2,
+    .font_label = 24,
+    .font_temp = 36,
+    .font_pop = 18,
+    .row_h = 36,
+    .day_row_h = 32,
+    .min_col_w = 40,
+    .bg_alpha = 190,
+};
+
+static bool layout_enabled = false;
+static char layout_path[512] = {0};
+static time_t layout_mtime = 0;
+static bool layout_seen = false;
+
 static WeatherState weather;
 static pthread_mutex_t weather_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t weather_thr;
@@ -1092,6 +1127,109 @@ static void weather_load_font(void);
 static float cli_lat = 0, cli_lon = 0;
 static bool cli_have_latlon = false;
 static char cli_city[128] = {0};
+
+static void layout_apply_kv(const char *key, const char *val) {
+    int v = atoi(val);
+    if (strcmp(key, "margin") == 0) layout.margin = v;
+    else if (strcmp(key, "pad") == 0) layout.pad = v;
+    else if (strcmp(key, "col_gap") == 0) layout.col_gap = v;
+    else if (strcmp(key, "row_gap") == 0) layout.row_gap = v;
+    else if (strcmp(key, "block_gap") == 0) layout.block_gap = v;
+    else if (strcmp(key, "font_label") == 0) layout.font_label = v;
+    else if (strcmp(key, "font_temp") == 0) layout.font_temp = v;
+    else if (strcmp(key, "font_pop") == 0) layout.font_pop = v;
+    else if (strcmp(key, "row_h") == 0) layout.row_h = v;
+    else if (strcmp(key, "day_row_h") == 0) layout.day_row_h = v;
+    else if (strcmp(key, "min_col_w") == 0) layout.min_col_w = v;
+    else if (strcmp(key, "bg_alpha") == 0) layout.bg_alpha = v;
+    // unknown keys ignored
+}
+
+static void layout_defaults(void) {
+    layout.margin = 16;
+    layout.pad = 6;
+    layout.col_gap = 2;
+    layout.row_gap = 0;
+    layout.block_gap = 2;
+    layout.font_label = 24;
+    layout.font_temp = 36;
+    layout.font_pop = 18;
+    layout.row_h = 36;
+    layout.day_row_h = 32;
+    layout.min_col_w = 40;
+    layout.bg_alpha = 190;
+}
+
+static void layout_clamp(void) {
+    if (layout.margin < 0) layout.margin = 0;
+    if (layout.pad < 0) layout.pad = 0;
+    if (layout.col_gap < 0) layout.col_gap = 0;
+    if (layout.row_gap < 0) layout.row_gap = 0;
+    if (layout.block_gap < 0) layout.block_gap = 0;
+    if (layout.font_label < 8) layout.font_label = 8;
+    if (layout.font_temp < 8) layout.font_temp = 8;
+    if (layout.font_pop < 8) layout.font_pop = 8;
+    if (layout.row_h < 12) layout.row_h = 12;
+    if (layout.day_row_h < 12) layout.day_row_h = 12;
+    if (layout.min_col_w < 16) layout.min_col_w = 16;
+    if (layout.bg_alpha < 0) layout.bg_alpha = 0;
+    if (layout.bg_alpha > 255) layout.bg_alpha = 255;
+}
+
+static bool layout_load(void) {
+    if (!layout_enabled || !layout_path[0]) return false;
+    FILE *f = fopen(layout_path, "r");
+    if (!f) return false;
+
+    LayoutCfg prev = layout;
+    layout_defaults(); // removed keys fall back to defaults
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '#' || *s == '\n' || *s == '\r' || *s == '\0') continue;
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = s;
+        char *val = eq + 1;
+        // trim key
+        char *ke = key + strlen(key);
+        while (ke > key && (ke[-1] == ' ' || ke[-1] == '\t')) *--ke = '\0';
+        // trim value
+        while (*val == ' ' || *val == '\t') val++;
+        char *ve = val + strlen(val);
+        while (ve > val && (ve[-1] == '\n' || ve[-1] == '\r' ||
+                            ve[-1] == ' ' || ve[-1] == '\t'))
+            *--ve = '\0';
+        if (!key[0] || !val[0]) continue;
+        layout_apply_kv(key, val);
+    }
+    fclose(f);
+    layout_clamp();
+
+    struct stat st;
+    if (stat(layout_path, &st) == 0) {
+        if (layout_seen && st.st_mtime != layout_mtime)
+            fprintf(stderr, "[memelock] layout: reloaded %s\n", layout_path);
+        layout_mtime = st.st_mtime;
+        layout_seen = true;
+    }
+
+    if (memcmp(&prev, &layout, sizeof(prev)) != 0)
+        return true;
+    return false;
+}
+
+// Poll mtime at most a few times/sec; no-op when layout mode is off.
+static void layout_poll(void) {
+    if (!layout_enabled || !layout_path[0]) return;
+    static double last = 0;
+    double now = GetTime();
+    if (now - last < 0.15) return;
+    last = now;
+    layout_load();
+}
 
 static void weather_cache_path(char *out, size_t n, const char *file) {
     const char *home = getenv("HOME");
@@ -1133,19 +1271,20 @@ static char *http_get(const char *url, int timeout_s) {
     return body;
 }
 
-static const char *wmo_label(int code) {
-    if (code == 0) return "clear";
-    if (code == 1) return "mainly clear";
-    if (code == 2) return "partly cloudy";
-    if (code == 3) return "overcast";
-    if (code == 45 || code == 48) return "fog";
-    if (code >= 51 && code <= 57) return "drizzle";
-    if (code >= 61 && code <= 67) return "rain";
-    if (code >= 71 && code <= 77) return "snow";
-    if (code >= 80 && code <= 82) return "showers";
-    if (code == 85 || code == 86) return "snow showers";
-    if (code >= 95) return "storm";
-    return "cloudy";
+// Temp digit color by WMO code — prognosis is encoded in the number color.
+static Color wmo_temp_color(int code) {
+    if (code == 0) return (Color){ 245, 215, 110, 255 }; // clear — yellow
+    if (code == 1) return (Color){ 240, 220, 140, 255 }; // mainly clear
+    if (code == 2) return (Color){ 232, 217, 160, 255 }; // partly cloudy
+    if (code == 3) return (Color){ 154, 160, 168, 255 }; // overcast — gray
+    if (code == 45 || code == 48) return (Color){ 176, 180, 186, 255 }; // fog
+    if (code >= 51 && code <= 57) return (Color){ 111, 168, 220, 255 }; // drizzle
+    if (code >= 61 && code <= 67) return (Color){ 111, 168, 220, 255 }; // rain
+    if (code >= 71 && code <= 77) return (Color){ 168, 208, 230, 255 }; // snow
+    if (code >= 80 && code <= 82) return (Color){ 111, 168, 220, 255 }; // showers
+    if (code == 85 || code == 86) return (Color){ 168, 208, 230, 255 }; // snow showers
+    if (code >= 95) return (Color){ 180, 142, 173, 255 }; // storm — violet
+    return (Color){ 154, 160, 168, 255 }; // cloudy
 }
 
 static const char *day_name(const char *iso) {
@@ -1188,11 +1327,12 @@ static bool weather_parse_forecast(const char *json_text) {
         json_object_get_type(o) == json_type_int)
         w.cur_pop = json_object_get_int(o);
 
-    json_object *h_t = NULL, *h_c = NULL, *h_p = NULL, *h_time = NULL;
+    json_object *h_t = NULL, *h_c = NULL, *h_p = NULL, *h_time = NULL, *h_day = NULL;
     json_object_object_get_ex(hourly, "temperature_2m", &h_t);
     json_object_object_get_ex(hourly, "weather_code", &h_c);
     json_object_object_get_ex(hourly, "precipitation_probability", &h_p);
     json_object_object_get_ex(hourly, "time", &h_time);
+    json_object_object_get_ex(hourly, "is_day", &h_day);
     if (!h_t || !h_time) {
         json_object_put(root);
         return false;
@@ -1211,6 +1351,11 @@ static bool weather_parse_forecast(const char *json_text) {
         if (j >= n) break;
         json_object *tj = json_object_array_get_idx(h_t, j);
         w.hour_temp[i] = tj ? (float)json_object_get_double(tj) : 0;
+        w.hour_is_day[i] = 1;
+        if (h_day) {
+            json_object *dj = json_object_array_get_idx(h_day, j);
+            if (dj) w.hour_is_day[i] = json_object_get_int(dj) ? 1 : 0;
+        }
         if (h_c) {
             json_object *cj = json_object_array_get_idx(h_c, j);
             w.hour_code[i] = cj ? json_object_get_int(cj) : 0;
@@ -1478,7 +1623,7 @@ static bool weather_fetch(void) {
              "?latitude=%.4f&longitude=%.4f"
              "&current=temperature_2m,weather_code,apparent_temperature,"
              "precipitation_probability"
-             "&hourly=temperature_2m,weather_code,precipitation_probability"
+             "&hourly=temperature_2m,weather_code,precipitation_probability,is_day"
              "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
              "precipitation_probability_max"
              "&forecast_days=7&timezone=auto",
@@ -1615,131 +1760,122 @@ static void weather_draw(int sw, int sh) {
     snap = weather;
     pthread_mutex_unlock(&weather_mu);
 
-    const Color ui_bg = { 10, 12, 18, 190 };
-    const Color c_title = { 140, 145, 155, 220 };
+    const int F_LABEL = layout.font_label;
+    const int F_TEMP = layout.font_temp;
+    const int F_POP = layout.font_pop;
+    const int F_DIM = F_LABEL;
+    const int pad = layout.pad;
+    const int margin = layout.margin;
+    const int col_gap = layout.col_gap;
+    const int row_gap = layout.row_gap;
+    const int block_gap = layout.block_gap;
+    const int row_h = layout.row_h;
+    const int day_row_h = layout.day_row_h;
+
     const Color c_label = { 170, 175, 185, 230 };
-    const Color c_temp = { 235, 238, 245, 255 };
     const Color c_pop = { 100, 140, 200, 220 };
     const Color c_dim = { 90, 95, 105, 200 };
+    Color ui_bg = { 10, 12, 18, (unsigned char)layout.bg_alpha };
 
-    // Fonts: doubles of prior sizes; temps tripled (14 → 42).
-    const int F_NOW = 40;
-    const int F_TITLE = 28;
-    const int F_LABEL = 28;
-    const int F_POP = 24;
-    const int F_TEMP = 42;
-    const int F_DIM = 32;
-
-    const int now_h = 78;
-    const int title_h = 34;
-    const int row_h = 50;
-    const int day_row_h = 46;
-    const int gap = 2;
-    const int hours_h = title_h + row_h * 3;
-    const int days_h = title_h + day_row_h * 4;
-
-    // Columns sized to the largest cell string at its font.
-    int col_w = 56;
-    for (int i = 0; i < W_HOURS; i++) {
-        int w = w_measure(snap.hour_label[i], F_LABEL);
-        char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.ready ? snap.hour_temp[i] : 0);
-        int wt = w_measure(tbuf, F_TEMP);
-        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.hour_pop[i] : 100);
-        int wp = w_measure(tbuf, F_POP);
-        int m = w;
-        if (wt > m) m = wt;
-        if (wp > m) m = wp;
-        if (m + 8 > col_w) col_w = m + 8;
-    }
-    for (int i = 0; i < W_DAYS; i++) {
-        int w = w_measure(snap.day_label[i], F_LABEL);
-        char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.ready ? snap.day_max[i] : 0);
-        int wt = w_measure(tbuf, F_TEMP);
-        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.day_pop[i] : 100);
-        int wp = w_measure(tbuf, F_POP);
-        int m = w;
-        if (wt > m) m = wt;
-        if (wp > m) m = wp;
-        if (m + 8 > col_w) col_w = m + 8;
-    }
-    if (col_w < 48) col_w = 48;
-
-    const int col_gap = 4;
-    int hours_w = W_HOURS * col_w + (W_HOURS - 1) * col_gap;
-    int days_w = W_DAYS * col_w + (W_DAYS - 1) * col_gap;
-    int content_w = hours_w > days_w ? hours_w : days_w;
-
-    char now_line[96];
-    if (snap.ready) {
-        snprintf(now_line, sizeof(now_line), "%.0f  %s  %d%%",
-                 snap.cur_temp, wmo_label(snap.cur_code), snap.cur_pop);
-        int now_text_w = w_measure(now_line, F_NOW);
-        if (now_text_w + W_PAD * 2 > content_w)
-            content_w = now_text_w + W_PAD * 2;
-    } else {
-        snprintf(now_line, sizeof(now_line), "weather...");
-        int now_text_w = w_measure(now_line, F_DIM);
-        if (now_text_w + W_PAD * 2 > content_w)
-            content_w = now_text_w + W_PAD * 2;
-    }
-
-    int panel_w = content_w + W_PAD * 2;
-    int panel_h = W_PAD + now_h + gap + hours_h + gap + days_h + W_PAD;
-    int px = W_MARGIN;
-    int py = sh - W_MARGIN - panel_h;
-    if (py < 0) py = 0;
-
-    DrawRectangle(px, py, panel_w, panel_h, ui_bg);
-
-    int cx = px + W_PAD;
-    int cy = py + W_PAD;
+    // Hours block rows: label | temp (day only) | pop (day only)
+    // Night hours: label only (no temp, no pop).
+    // Days block rows: label | high | pop   (no lows)
+    const int hours_rows = 3;
+    const int days_rows = 3;
+    int hours_h = hours_rows * row_h + (hours_rows - 1) * row_gap;
+    int days_h = days_rows * day_row_h + (days_rows - 1) * row_gap;
+    int blocks_h = hours_h + block_gap + days_h;
+    int panel_content_h = blocks_h;
 
     if (!snap.ready) {
-        int tw = w_measure(now_line, F_DIM);
-        int tx = px + (panel_w - tw) / 2;
-        int ty = cy + (now_h - F_DIM) / 2;
-        w_draw(now_line, tx, ty, F_DIM, c_dim);
+        int panel_w = w_measure("weather...", F_DIM) + pad * 2;
+        int panel_h = F_DIM + pad * 2;
+        int px = margin;
+        int py = sh - margin - panel_h;
+        if (py < 0) py = 0;
+        DrawRectangle(px, py, panel_w, panel_h, ui_bg);
+        int tx = px + pad;
+        int tw = w_measure("weather...", F_DIM);
+        w_draw("weather...", px + (panel_w - tw) / 2, py + pad, F_DIM, c_dim);
         if (snap.fetching)
-            w_draw("...", tx + tw + 6, ty, F_DIM, c_dim);
+            w_draw("...", tx + tw + 4, py + pad, F_DIM, c_dim);
+        (void)sw;
         return;
     }
 
-    // NOW
-    w_draw(now_line, cx, cy + (now_h - F_NOW) / 2, F_NOW, c_temp);
+    // Column width: max of label / temp / pop at each font (day cells only matter for temp).
+    int col_w = layout.min_col_w;
+    for (int i = 0; i < W_HOURS; i++) {
+        int m = w_measure(snap.hour_label[i], F_LABEL);
+        if (snap.hour_is_day[i]) {
+            char tbuf[16];
+            int wt;
+            snprintf(tbuf, sizeof(tbuf), "%.0f", snap.hour_temp[i]);
+            wt = w_measure(tbuf, F_TEMP);
+            if (wt > m) m = wt;
+            snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
+            wt = w_measure(tbuf, F_POP);
+            if (wt > m) m = wt;
+        }
+        if (m + 6 > col_w) col_w = m + 6;
+    }
+    for (int i = 0; i < W_DAYS; i++) {
+        int m = w_measure(snap.day_label[i], F_LABEL);
+        char tbuf[16];
+        int wt;
+        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_max[i]);
+        wt = w_measure(tbuf, F_TEMP);
+        if (wt > m) m = wt;
+        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
+        wt = w_measure(tbuf, F_POP);
+        if (wt > m) m = wt;
+        if (m + 6 > col_w) col_w = m + 6;
+    }
 
-    // HOURS: title + label/temp/pop rows in fixed columns
-    int hy = cy + now_h + gap;
-    w_draw("next", cx, hy + (title_h - F_TITLE) / 2, F_TITLE, c_title);
-    hy += title_h;
+    int hours_w = W_HOURS * col_w + (W_HOURS - 1) * col_gap;
+    int days_w = W_DAYS * col_w + (W_DAYS - 1) * col_gap;
+    int content_w = hours_w > days_w ? hours_w : days_w;
+    int panel_w = content_w + pad * 2;
+    int panel_h = panel_content_h + pad * 2;
+    int px = margin;
+    int py = sh - margin - panel_h;
+    if (py < 0) py = 0;
+
+    DrawRectangle(px, py, panel_w, panel_h, ui_bg);
+    int cx = px + pad;
+    int cy = py + pad;
+
+    // --- Hours ---
+    int hy = cy;
     for (int i = 0; i < W_HOURS; i++) {
         int x = cx + i * (col_w + col_gap);
         w_cell(snap.hour_label[i], x, hy, col_w, row_h, F_LABEL, c_label);
+        if (!snap.hour_is_day[i]) continue;
         char tbuf[16];
+        int ytemp = hy + row_h + row_gap;
+        int ypop = ytemp + row_h + row_gap;
         snprintf(tbuf, sizeof(tbuf), "%.0f", snap.hour_temp[i]);
-        w_cell(tbuf, x, hy + row_h, col_w, row_h, F_TEMP, c_temp);
+        w_cell(tbuf, x, ytemp, col_w, row_h, F_TEMP,
+               wmo_temp_color(snap.hour_code[i]));
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
-        w_cell(tbuf, x, hy + row_h * 2, col_w, row_h, F_POP, c_pop);
+        w_cell(tbuf, x, ypop, col_w, row_h, F_POP, c_pop);
     }
 
-    // DAYS: title + day/min/max/pop rows
-    int dy = cy + now_h + gap + hours_h + gap;
-    w_draw("week", cx, dy + (title_h - F_TITLE) / 2, F_TITLE, c_title);
-    dy += title_h;
+    // --- Days (highs only) ---
+    int dy = cy + hours_h + block_gap;
     for (int i = 0; i < W_DAYS; i++) {
         int x = cx + i * (col_w + col_gap);
         w_cell(snap.day_label[i], x, dy, col_w, day_row_h, F_LABEL, c_label);
         char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_min[i]);
-        w_cell(tbuf, x, dy + day_row_h, col_w, day_row_h, F_TEMP, c_pop);
+        int yhigh = dy + day_row_h + row_gap;
+        int ypop = yhigh + day_row_h + row_gap;
         snprintf(tbuf, sizeof(tbuf), "%.0f", snap.day_max[i]);
-        w_cell(tbuf, x, dy + day_row_h * 2, col_w, day_row_h, F_TEMP, c_temp);
+        w_cell(tbuf, x, yhigh, col_w, day_row_h, F_TEMP,
+               wmo_temp_color(snap.day_code[i]));
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
-        w_cell(tbuf, x, dy + day_row_h * 3, col_w, day_row_h, F_POP, c_pop);
+        w_cell(tbuf, x, ypop, col_w, day_row_h, F_POP, c_pop);
     }
 
-    (void)days_h;
     (void)sw;
 }
 
@@ -1754,6 +1890,8 @@ static void print_usage(const char *prog) {
            "  --no-weather            disable weather widget\n"
            "  --city=NAME[,CC]        city for weather (e.g. Vilnius or Paris,FR)\n"
            "  --lat=LAT --lon=LON     exact coordinates for weather\n"
+           "  --layout[=PATH]         live-reload weather layout file\n"
+           "                          (default ~/.cache/memelock/layout.txt)\n"
            "  --snow-speed=N          snowfall speed multiplier (default 1.0)\n"
            "  --snow-tint=MODE        flake color: white | ice | mix (default mix)\n"
            "\n"
@@ -1796,6 +1934,12 @@ int main(int argc, char **argv) {
         } else if (strncmp(argv[i], "--lon=", 6) == 0) {
             cli_lon = (float)strtod(argv[i] + 6, NULL);
             cli_have_latlon = true;
+        } else if (strcmp(argv[i], "--layout") == 0) {
+            layout_enabled = true;
+            weather_cache_path(layout_path, sizeof(layout_path), "layout.txt");
+        } else if (strncmp(argv[i], "--layout=", 9) == 0) {
+            layout_enabled = true;
+            snprintf(layout_path, sizeof(layout_path), "%s", argv[i] + 9);
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1825,6 +1969,11 @@ int main(int argc, char **argv) {
     lock_grab_startup(); // bounded (~3s max), before first frame only
 
     weather_start();
+    if (layout_enabled) {
+        layout_clamp();
+        layout_load(); // initial load if file exists
+        fprintf(stderr, "[memelock] layout: live reload on %s\n", layout_path);
+    }
 
     SetTargetFPS(60);
     SetExitKey(KEY_NULL);
@@ -1942,7 +2091,8 @@ int main(int argc, char **argv) {
                       hint_width + 20, hint_size + 16, ui_bg);
         DrawText(hint, hint_x, hint_y, hint_size, GRAY);
 
-        // Weather widget — fixed layout, bottom-left (Ctrl+R toggles).
+        // Weather widget — compact layout, bottom-left (Ctrl+R toggles).
+        layout_poll();
         weather_draw(sw, sh);
 
         // Tiny, dull version tag — bottom-right, easy to miss on purpose.

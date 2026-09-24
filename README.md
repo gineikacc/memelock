@@ -28,6 +28,7 @@ Depends on: raylib, X11 (+ Xrandr/Xinerama/Xi/Xcursor), PAM (`libpam`, `libpam_m
 | `--weather` / `--no-weather` | weather widget on/off at start (default **on**) |
 | `--city=NAME[,CC]` | weather location by city (`Vilnius`, `Paris,FR`) |
 | `--lat=` / `--lon=` | exact weather coordinates (wins over city) |
+| `--layout[=PATH]` | live-reload weather layout file (default `~/.cache/memelock/layout.txt`) |
 | `--snow-speed=N` | fall-speed multiplier (default `1.0`) |
 | `--snow-tint=MODE` | `white` \| `ice` \| `mix` (default `mix`) |
 
@@ -35,10 +36,34 @@ While locked: **Ctrl+R** toggles the weather widget (Ctrl+W still deletes word).
 
 ## Weather widget (bottom-left)
 
-- **Open-Meteo** (no API key): current conditions, next **12 hours**, **7 days**
-- Each hour/day column: label, temp(s), rain chance %
+- **Open-Meteo** (no API key): next **12 hours** + **7 days** (no separate “today” row)
+- Hours: label · temp · rain% — **night hours show label only** (no temp, no %)
+- Days: label · **high** · rain% (no lows)
+- Temp digits colored by weather (clear=yellow, overcast=gray, rain=blue, snow=ice, storm=violet)
 - Location order: `--lat/--lon` → `--city=` → cached IP geolocation (`ipapi.co`)
 - Cached under `~/.cache/memelock/`; refreshes ~every 15 min in a background thread
+
+### Layout file (optional)
+
+With `--layout` (or `--layout=PATH`), edits to the file hot-reload ~6×/sec:
+
+```
+# ~/.cache/memelock/layout.txt
+margin=16
+pad=6
+col_gap=2
+row_gap=0
+block_gap=2
+font_label=24
+font_temp=36
+font_pop=18
+row_h=36
+day_row_h=32
+min_col_w=40
+bg_alpha=190
+```
+
+Unknown keys are ignored; missing file → built-in compact defaults.
 
 Unknown flags print usage and exit 1.
 

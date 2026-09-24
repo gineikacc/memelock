@@ -21,8 +21,8 @@ Must stay `-Wall -Wextra` clean. No test suite. Binary name stays `memelock`.
 2. **Password** — `pump_x11_input` / `handle_xkey` / `ctrl_binds` / `authenticate` (PAM). Raylib does not receive keys.
 3. **Snow sim** — flakes, heightmap `pile[]`, float tint channels, `pile_relax` avalanche, lava → obsidian.
 4. **Background** — root screenshot before `InitWindow`, float Gaussian + dither, upload after GL context.
-5. **Weather** — Open-Meteo via libcurl + json-c, pthread fetch, cache in `~/.cache/memelock/`, fixed-cell widget bottom-left. Ctrl+R toggles.
-6. **Main loop** — swallow `WindowShouldClose`, re-grab, pump X, auth, `snow_update`, draw scene + UI boxes + weather.
+5. **Weather** — Open-Meteo via libcurl + json-c, pthread fetch, cache in `~/.cache/memelock/`, compact fixed-cell widget bottom-left (no today line/titles; night hours = label only; day highs only). Temp color = WMO code. Ctrl+R toggles. Optional live layout file via `--layout[=PATH]`.
+6. **Main loop** — swallow `WindowShouldClose`, re-grab, pump X, auth, `snow_update`, `layout_poll`, draw scene + UI boxes + weather.
 
 ## Product decisions (respect these)
 
@@ -32,6 +32,8 @@ Must stay `-Wall -Wextra` clean. No test suite. Binary name stays `memelock`.
 - Flake spawn: **start with 1**, interval = avg fall time / limit.
 - Tint must not darken over time: keep pile RGB in **float**, round once in `pile_color_at`.
 - Lava spawn rate currently **1/500** (user “for now” test rate; original was 1/5000).
+- Weather: **no** today banner, **no** `next`/`week` titles, **no** day lows, **no** night hour temps or night rain%. Prognosis color = weather code on temp digits.
+- Layout file is **opt-in** (`--layout`); default off — do not read/stat it otherwise.
 
 ## Docket (from source comment + history)
 
@@ -57,3 +59,4 @@ Must stay `-Wall -Wextra` clean. No test suite. Binary name stays `memelock`.
 - Hold Super/Alt while typing: must not insert; Shift must insert.
 - `./memelock --city=Paris,France` for geocoded weather; `--no-weather` to hide widget.
 - Ctrl+R toggles widget; Ctrl+W still deletes word.
+- `./memelock --layout` then edit `~/.cache/memelock/layout.txt` — gaps/fonts update live.
