@@ -1082,6 +1082,9 @@ static pthread_mutex_t weather_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t weather_thr;
 static bool weather_thr_started = false;
 static bool weather_shutdown = false;
+static Font weather_font = {0};
+static bool weather_font_owned = false;
+static void weather_load_font(void);
 
 static float cli_lat = 0, cli_lon = 0;
 static bool cli_have_latlon = false;
@@ -1219,8 +1222,9 @@ static bool weather_parse_forecast(const char *json_text) {
         } else {
             json_object *timej = json_object_array_get_idx(h_time, j);
             const char *ts = timej ? json_object_get_string(timej) : NULL;
+            // "2026-09-24T11:00" -> "11" (no ":00")
             if (ts && strlen(ts) >= 13)
-                snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "%s", ts + 11);
+                snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "%d", atoi(ts + 11));
             else
                 snprintf(w.hour_label[i], sizeof(w.hour_label[i]), "+%d", i);
         }
@@ -1519,6 +1523,7 @@ static void *weather_thread(void *arg) {
 static void weather_start(void) {
     if (!weather_enabled) return;
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    weather_load_font();
 
     if (cli_have_latlon || cli_city[0])
         weather_resolve_location();
@@ -1541,16 +1546,62 @@ static void weather_stop(void) {
         pthread_join(weather_thr, NULL);
         weather_thr_started = false;
     }
+    if (weather_font_owned && weather_font.texture.id > 0) {
+        UnloadFont(weather_font);
+        weather_font = (Font){0};
+        weather_font_owned = false;
+    }
     curl_global_cleanup();
 }
 
+// Widget font: sleek humanist sans, not raylib's boxy default.
+static void weather_load_font(void) {
+    const char *cands[] = {
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/Ubuntu-R.ttf",
+        NULL,
+    };
+    for (int i = 0; cands[i]; i++) {
+        if (!FileExists(cands[i])) continue;
+        Font f = LoadFontEx(cands[i], 64, NULL, 0);
+        if (f.texture.id > 0) {
+            weather_font = f;
+            weather_font_owned = true;
+            SetTextureFilter(weather_font.texture, TEXTURE_FILTER_BILINEAR);
+            return;
+        }
+    }
+    weather_font = GetFontDefault();
+    weather_font_owned = false;
+}
+
+static Font *w_font_ptr(void) {
+    if (weather_font.texture.id > 0) return &weather_font;
+    return NULL;
+}
+
+static int w_measure(const char *s, int size) {
+    Font *f = w_font_ptr();
+    if (f) return (int)MeasureTextEx(*f, s, (float)size, 0.0f).x;
+    return MeasureText(s, size);
+}
+
+static void w_draw(const char *s, int x, int y, int size, Color c) {
+    Font *f = w_font_ptr();
+    if (f) DrawTextEx(*f, s, (Vector2){ (float)x, (float)y }, (float)size, 0.0f, c);
+    else DrawText(s, x, y, size, c);
+}
+
 static void w_cell(const char *s, int x, int y, int w, int h, int font, Color c) {
-    int tw = MeasureText(s, font);
+    int tw = w_measure(s, font);
     int tx = x + (w - tw) / 2;
     int ty = y + (h - font) / 2;
     if (tx < x) tx = x;
     if (ty < y) ty = y;
-    DrawText(s, tx, ty, font, c);
+    w_draw(s, tx, ty, font, c);
 }
 
 static void weather_draw(int sw, int sh) {
@@ -1568,28 +1619,65 @@ static void weather_draw(int sw, int sh) {
     const Color c_pop = { 100, 140, 200, 220 };
     const Color c_dim = { 90, 95, 105, 200 };
 
-    const int now_h = 44;
-    const int title_h = 16;
-    const int row_h = 18;
-    const int day_row_h = 16;
-    const int gap = 8;
+    // Fonts: doubles of prior sizes; temps tripled (14 → 42).
+    const int F_NOW = 40;
+    const int F_TITLE = 28;
+    const int F_LABEL = 28;
+    const int F_POP = 24;
+    const int F_TEMP = 42;
+    const int F_DIM = 32;
+
+    const int now_h = 96;
+    const int title_h = 40;
+    const int row_h = 56;
+    const int day_row_h = 52;
+    const int gap = 14;
     const int hours_h = title_h + row_h * 3;
     const int days_h = title_h + day_row_h * 4;
 
-    int hours_w = W_HOURS * W_COL_W + (W_HOURS - 1) * W_COL_GAP;
-    int days_w = W_DAYS * W_COL_W + (W_DAYS - 1) * W_COL_GAP;
+    // Columns sized to the largest cell string at its font.
+    int col_w = 64;
+    for (int i = 0; i < W_HOURS; i++) {
+        int w = w_measure(snap.hour_label[i], F_LABEL);
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.ready ? snap.hour_temp[i] : 0);
+        int wt = w_measure(tbuf, F_TEMP);
+        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.hour_pop[i] : 100);
+        int wp = w_measure(tbuf, F_POP);
+        int m = w;
+        if (wt > m) m = wt;
+        if (wp > m) m = wp;
+        if (m + 16 > col_w) col_w = m + 16;
+    }
+    for (int i = 0; i < W_DAYS; i++) {
+        int w = w_measure(snap.day_label[i], F_LABEL);
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.ready ? snap.day_max[i] : 0);
+        int wt = w_measure(tbuf, F_TEMP);
+        snprintf(tbuf, sizeof(tbuf), "%d%%", snap.ready ? snap.day_pop[i] : 100);
+        int wp = w_measure(tbuf, F_POP);
+        int m = w;
+        if (wt > m) m = wt;
+        if (wp > m) m = wp;
+        if (m + 16 > col_w) col_w = m + 16;
+    }
+    if (col_w < 56) col_w = 56;
+
+    const int col_gap = 14;
+    int hours_w = W_HOURS * col_w + (W_HOURS - 1) * col_gap;
+    int days_w = W_DAYS * col_w + (W_DAYS - 1) * col_gap;
     int content_w = hours_w > days_w ? hours_w : days_w;
 
     char now_line[96];
     if (snap.ready) {
         snprintf(now_line, sizeof(now_line), "%.0f°  %s  %d%%",
                  snap.cur_temp, wmo_label(snap.cur_code), snap.cur_pop);
-        int now_text_w = MeasureText(now_line, 20);
+        int now_text_w = w_measure(now_line, F_NOW);
         if (now_text_w + W_PAD * 2 > content_w)
             content_w = now_text_w + W_PAD * 2;
     } else {
         snprintf(now_line, sizeof(now_line), "weather...");
-        int now_text_w = MeasureText(now_line, 16);
+        int now_text_w = w_measure(now_line, F_DIM);
         if (now_text_w + W_PAD * 2 > content_w)
             content_w = now_text_w + W_PAD * 2;
     }
@@ -1606,46 +1694,46 @@ static void weather_draw(int sw, int sh) {
     int cy = py + W_PAD;
 
     if (!snap.ready) {
-        int tw = MeasureText(now_line, 16);
+        int tw = w_measure(now_line, F_DIM);
         int tx = px + (panel_w - tw) / 2;
-        int ty = cy + (now_h - 16) / 2;
-        DrawText(now_line, tx, ty, 16, c_dim);
+        int ty = cy + (now_h - F_DIM) / 2;
+        w_draw(now_line, tx, ty, F_DIM, c_dim);
         if (snap.fetching)
-            DrawText("...", tx + tw + 4, ty, 16, c_dim);
+            w_draw("...", tx + tw + 6, ty, F_DIM, c_dim);
         return;
     }
 
     // NOW
-    DrawText(now_line, cx, cy + (now_h - 20) / 2, 20, c_temp);
+    w_draw(now_line, cx, cy + (now_h - F_NOW) / 2, F_NOW, c_temp);
 
     // HOURS: title + label/temp/pop rows in fixed columns
     int hy = cy + now_h + gap;
-    DrawText("next", cx, hy, 14, c_title);
+    w_draw("next", cx, hy + (title_h - F_TITLE) / 2, F_TITLE, c_title);
     hy += title_h;
     for (int i = 0; i < W_HOURS; i++) {
-        int x = cx + i * (W_COL_W + W_COL_GAP);
-        w_cell(snap.hour_label[i], x, hy, W_COL_W, row_h, 14, c_label);
+        int x = cx + i * (col_w + col_gap);
+        w_cell(snap.hour_label[i], x, hy, col_w, row_h, F_LABEL, c_label);
         char tbuf[16];
         snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.hour_temp[i]);
-        w_cell(tbuf, x, hy + row_h, W_COL_W, row_h, 14, c_temp);
+        w_cell(tbuf, x, hy + row_h, col_w, row_h, F_TEMP, c_temp);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.hour_pop[i]);
-        w_cell(tbuf, x, hy + row_h * 2, W_COL_W, row_h, 12, c_pop);
+        w_cell(tbuf, x, hy + row_h * 2, col_w, row_h, F_POP, c_pop);
     }
 
     // DAYS: title + day/min/max/pop rows
     int dy = cy + now_h + gap + hours_h + gap;
-    DrawText("week", cx, dy, 14, c_title);
+    w_draw("week", cx, dy + (title_h - F_TITLE) / 2, F_TITLE, c_title);
     dy += title_h;
     for (int i = 0; i < W_DAYS; i++) {
-        int x = cx + i * (W_COL_W + W_COL_GAP);
-        w_cell(snap.day_label[i], x, dy, W_COL_W, day_row_h, 14, c_label);
+        int x = cx + i * (col_w + col_gap);
+        w_cell(snap.day_label[i], x, dy, col_w, day_row_h, F_LABEL, c_label);
         char tbuf[16];
         snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_min[i]);
-        w_cell(tbuf, x, dy + day_row_h, W_COL_W, day_row_h, 14, c_pop);
+        w_cell(tbuf, x, dy + day_row_h, col_w, day_row_h, F_TEMP, c_pop);
         snprintf(tbuf, sizeof(tbuf), "%.0f°", snap.day_max[i]);
-        w_cell(tbuf, x, dy + day_row_h * 2, W_COL_W, day_row_h, 14, c_temp);
+        w_cell(tbuf, x, dy + day_row_h * 2, col_w, day_row_h, F_TEMP, c_temp);
         snprintf(tbuf, sizeof(tbuf), "%d%%", snap.day_pop[i]);
-        w_cell(tbuf, x, dy + day_row_h * 3, W_COL_W, day_row_h, 12, c_pop);
+        w_cell(tbuf, x, dy + day_row_h * 3, col_w, day_row_h, F_POP, c_pop);
     }
 
     (void)days_h;
